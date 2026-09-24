@@ -7,17 +7,17 @@ const dockerHub = "https://registry-1.docker.io";
 
 const routes = {
   // production
-  ["docker." + aburling.dpdns.org]: dockerHub,
-  ["quay." + aburling.dpdns.org]: "https://quay.io",
-  ["gcr." + aburling.dpdns.org]: "https://gcr.io",
-  ["k8s-gcr." + aburling.dpdns.org]: "https://k8s.gcr.io",
-  ["k8s." + aburling.dpdns.org]: "https://registry.k8s.io",
-  ["ghcr." + aburling.dpdns.org]: "https://ghcr.io",
-  ["cloudsmith." + aburling.dpdns.org]: "https://docker.cloudsmith.io",
-  ["ecr." + aburling.dpdns.org]: "https://public.ecr.aws",
+  ["docker.aburling.dpdns.org"]: dockerHub,
+  ["quay.aburling.dpdns.org"]: "https://quay.io",
+  ["gcr.aburling.dpdns.org"]: "https://gcr.io",
+  ["k8s-gcr.aburling.dpdns.org"]: "https://k8s.gcr.io",
+  ["k8s.aburling.dpdns.org"]: "https://registry.k8s.io",
+  ["ghcr.aburling.dpdns.org"]: "https://ghcr.io",
+  ["cloudsmith.aburling.dpdns.org"]: "https://docker.cloudsmith.io",
+  ["ecr.aburling.dpdns.org"]: "https://public.ecr.aws",
 
   // staging
-  ["docker-staging." + CUSTOM_DOMAIN]: dockerHub,
+  ["docker-staging.aburling.dpdns.org]: dockerHub,
 };
 
 function routeByHosts(host) {
