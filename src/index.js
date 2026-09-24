@@ -17,7 +17,7 @@ const routes = {
   ["ecr.aburling.dpdns.org"]: "https://public.ecr.aws",
 
   // staging
-  ["docker-staging.aburling.dpdns.org]: dockerHub,
+  ["docker-staging.aburling.dpdns.org"]: dockerHub,
 };
 
 function routeByHosts(host) {
