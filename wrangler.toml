@@ -32,7 +32,33 @@ local_protocol = "http"
 [vars]
 MODE = "production"
 TARGET_UPSTREAM = ""
-CUSTOM_DOMAIN = "aburling.dpdns.org"
+CUSTOM_DOMAIN = "aburling.dpdns.org"   # ⚠️ 死变量：代码里从没读过它，改它没用
+
+# --- 路由表（[8] 可配置化，2026-09-25 新增）---
+#
+# 决定「哪个主机名 → 哪个上游 registry」。**不配就用 src/index.js 里内置的表**
+# （即下面的 aburling.dpdns.org 那一套）⇒ 现有部署零影响。
+#
+# ⚠️ 为什么要加这个：原来 routes 硬编码在 src/index.js 里，于是
+#    别人把这个项目部署到**自己的** Cloudflare 账号后，请求自己的域名或
+#    xxx.workers.dev 会直接 HOST_NOT_CONFIGURED 404（看着像部署失败）。
+#    现在改成读环境变量，同一份代码就能服务多个实例，不用改源码。
+#
+# 格式：host=upstream,host=upstream  （也接受 JSON：{"host":"upstream"}）
+#   - 键 = 主机名，精确匹配、大小写不敏感；写 `*.example.com` 则匹配其任意子域
+#          （**不含**裸域 example.com，要裸域就再写一条精确规则）
+#   - 值 = 上游 registry 基址，**必须带 https://**
+#   - 配了它 = 整体替换内置表（不是合并）
+#
+# REGISTRY_ROUTES = "docker.example.com=https://registry-1.docker.io,ghcr.example.com=https://ghcr.io"
+#
+# 只想代理一个 registry、不挑主机名（典型：只有 xxx.workers.dev、没自己的域名）
+# 就配这个兜底上游，任意主机名都会放行：
+#
+# DEFAULT_UPSTREAM = "https://registry-1.docker.io"
+#
+# 注：`CUSTOM_DOMAIN` 是上游遗留的死变量（代码没读过），别拿它当路由配置用。
+#     真正生效的只有内置表 / REGISTRY_ROUTES / DEFAULT_UPSTREAM 三者。
 
 # --- 访问控制（[7] 轻量鉴权 + 速率限制）---
 #

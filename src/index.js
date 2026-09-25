@@ -329,7 +329,91 @@ function responseAuthRequired() {
   );
 }
 
-const routes = {
+// ---------------------------------------------------------------------------
+// [8] 路由表可配置化：让**同一份代码**能服务多个实例（自己用 + 给别人部署）
+//
+// 背景（为什么必须改）：
+//   原版把路由表硬编码成 `*.aburling.dpdns.org`，于是：
+//     ① 别人把这个项目部署到**自己的** Cloudflare 账号后，请求
+//        `xxx.<account>.workers.dev` 或自己的域名 → 命中不了任何 key →
+//        直接 `HOST_NOT_CONFIGURED` 404，看起来像"部署失败"，其实是配置缺失；
+//     ② 每来一个使用者就要改一次源码 → 无法做「一键部署」。
+//   `wrangler.toml` 里的 `CUSTOM_DOMAIN` 是个**死变量**（代码里从没读过它），
+//   别被它误导 —— 真正生效的只有下面这张表。
+//
+// 现在：优先读环境变量，**没配就回落到原来的硬编码表** ⇒ 对现有部署零影响。
+//
+//   REGISTRY_ROUTES   "docker.a.com=https://registry-1.docker.io,*.b.com=https://ghcr.io"
+//                     也接受 JSON：{"docker.a.com":"https://registry-1.docker.io"}
+//                     键 = 主机名（精确匹配，大小写不敏感），或以 `*.` 开头的通配
+//                          （匹配其任意**子域**，不含裸域本身）
+//                     值 = 上游 registry 基址（必须带 https://）
+//   DEFAULT_UPSTREAM  "https://registry-1.docker.io"
+//                     没有任何路由命中时的兜底上游。给"只用 workers.dev、
+//                     只代理一个 registry"的场景用；不配则无命中的主机仍返回 404。
+//
+// ⚠️ 命名规则同 [7]：本文件的局部常量**不能**叫 REGISTRY_ROUTES / DEFAULT_UPSTREAM，
+//    否则会遮蔽同名环境变量，`typeof X` 撞上 TDZ 直接抛错。故加 `_RAW` 后缀。
+// ---------------------------------------------------------------------------
+const REGISTRY_ROUTES_RAW =
+  typeof REGISTRY_ROUTES !== "undefined" && REGISTRY_ROUTES !== null
+    ? String(REGISTRY_ROUTES)
+    : "";
+const DEFAULT_UPSTREAM_RAW =
+  typeof DEFAULT_UPSTREAM !== "undefined" && DEFAULT_UPSTREAM !== null
+    ? String(DEFAULT_UPSTREAM)
+    : "";
+
+/**
+ * 解析 REGISTRY_ROUTES。支持 `host=upstream,host=upstream` 与 JSON 对象两种形态。
+ * 返回**无原型**对象（`Object.create(null)`）：
+ *   - 防止 `__proto__` / `constructor` 这类键污染原型链
+ *   - 同时让 `__proto__` 变成一个普通 key（永不匹配主机名，无害）
+ * 解析失败的片段只打 warn 跳过，**绝不抛错**（配置写错不该让服务起不来）。
+ */
+function parseRoutes(raw) {
+  const out = Object.create(null);
+  const text = String(raw == null ? "" : raw).trim();
+  if (!text) return out;
+
+  const put = (host, upstream) => {
+    const h = String(host == null ? "" : host).trim().toLowerCase();
+    const u = String(upstream == null ? "" : upstream).trim();
+    if (!h || !u) return;
+    if (!/^https?:\/\//i.test(u)) {
+      console.warn("[cf-dproxy] REGISTRY_ROUTES 上游缺少 http(s):// 前缀，已跳过：" + h + "=" + u);
+      return;
+    }
+    out[h] = u;
+  };
+
+  // 形态一：JSON 对象
+  if (text.charAt(0) === "{") {
+    try {
+      const obj = JSON.parse(text);
+      for (const k of Object.keys(obj)) put(k, obj[k]);
+    } catch (e) {
+      console.warn("[cf-dproxy] REGISTRY_ROUTES 不是合法 JSON，已忽略整串：" + e.message);
+    }
+    return out;
+  }
+
+  // 形态二：host=upstream,host=upstream
+  for (const seg of text.split(",")) {
+    const s = seg.trim();
+    if (!s) continue;
+    const i = s.indexOf("=");
+    if (i <= 0) {
+      console.warn("[cf-dproxy] REGISTRY_ROUTES 片段缺少 `=`，已跳过：" + s);
+      continue;
+    }
+    put(s.slice(0, i), s.slice(i + 1));
+  }
+  return out;
+}
+
+// 原硬编码表 —— 保持原样，作为"没配 REGISTRY_ROUTES"时的默认值。
+const DEFAULT_ROUTES = {
   // production
   ["docker.aburling.dpdns.org"]: dockerHub,
   ["quay.aburling.dpdns.org"]: "https://quay.io",
@@ -347,10 +431,57 @@ const routes = {
   ["docker-staging.aburling.dpdns.org"]: dockerHub,
 };
 
+const ROUTES_FROM_ENV = parseRoutes(REGISTRY_ROUTES_RAW);
+const ROUTES_SOURCE = Object.keys(ROUTES_FROM_ENV).length ? "env" : "default";
+const routes = ROUTES_SOURCE === "env" ? ROUTES_FROM_ENV : DEFAULT_ROUTES;
+
+if (ROUTES_SOURCE === "env") {
+  console.log(
+    "[cf-dproxy] 路由表来自 REGISTRY_ROUTES（" +
+      Object.keys(routes).length +
+      " 条）：" +
+      Object.keys(routes).join(", ")
+  );
+} else if (DEFAULT_UPSTREAM_RAW) {
+  console.log(
+    "[cf-dproxy] 未配 REGISTRY_ROUTES，使用硬编码默认表；无命中时兜底到 " + DEFAULT_UPSTREAM_RAW
+  );
+}
+
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+/**
+ * 主机名 → 上游 registry。
+ * 匹配顺序：① 精确（大小写不敏感）→ ② `*.` 通配子域 → ③ DEFAULT_UPSTREAM → ④ debug 兜底。
+ * 全部不中返回 ""（调用方据此返回 HOST_NOT_CONFIGURED 404）。
+ */
 function routeByHosts(host) {
-  if (host in routes) {
-    return routes[host];
+  const h = String(host == null ? "" : host).trim().toLowerCase();
+  if (!h) return "";
+
+  // ① 精确匹配。用 hasOwnProperty 而不是 `in` —— 否则 "constructor" / "toString"
+  //    这类主机名会顺着原型链命中 Object.prototype 上的成员，返回一个函数当上游。
+  if (hasOwn(routes, h)) {
+    return routes[h];
   }
+
+  // ② `*.example.com` 通配：匹配任意子域，但**不含**裸域 example.com 本身
+  //    （要裸域就再写一条精确规则）。
+  for (const key of Object.keys(routes)) {
+    if (key.length > 2 && key.slice(0, 2) === "*.") {
+      const suffix = key.slice(1); // ".example.com"
+      if (h.length > suffix.length && h.slice(-suffix.length) === suffix) {
+        return routes[key];
+      }
+    }
+  }
+
+  // ③ 兜底上游（单 registry / workers.dev 场景）
+  if (DEFAULT_UPSTREAM_RAW) {
+    return DEFAULT_UPSTREAM_RAW;
+  }
+
+  // ④ 本地调试
   if (RUNTIME_MODE === "debug") {
     return RUNTIME_TARGET_UPSTREAM;
   }
@@ -398,15 +529,18 @@ async function handleRequestInner(request, event) {
   }
   const upstream = routeByHosts(url.hostname);
   if (upstream === "") {
-    // 主机名不在 routes 表里 —— 这就是"自定义域 404"的来源
+    // 主机名不在路由表里 —— 这就是"自定义域 404"的来源
     return new Response(
       JSON.stringify(
         {
           error: "HOST_NOT_CONFIGURED",
           message:
-            "该主机名不在 Worker 的 routes 表中。请把自定义域的主机名加入 src/index.js 的 routes，" +
-            "或在 wrangler.toml 里为它配置 route/custom_domain。",
+            "该主机名不在路由表里。请把它的主机名加进环境变量 REGISTRY_ROUTES" +
+            "（形如 docker.example.com=https://registry-1.docker.io，" +
+            "支持 *.example.com 通配），" +
+            "若只想代理一个 registry、任意主机名都放行，就设 DEFAULT_UPSTREAM。",
           receivedHost: url.hostname,
+          routesSource: ROUTES_SOURCE, // env = 来自 REGISTRY_ROUTES；default = 内置表
           routes: routes,
         },
         null,

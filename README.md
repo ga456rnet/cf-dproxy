@@ -9,9 +9,9 @@ Due to the current instability, this project is not recommended for production u
 We will provide updates as soon as more information becomes available.
 
 
-![deploy](https://github.com/ciiiii/cloudflare-docker-proxy/actions/workflows/deploy.yaml/badge.svg)
+![deploy](https://github.com/ga456rnet/cf-dproxy/actions/workflows/deploy.yaml/badge.svg)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ciiiii/cloudflare-docker-proxy)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ga456rnet/cf-dproxy)
 
 > If you're looking for proxy for helm, maybe you can try [cloudflare-helm-proxy](https://github.com/ciiiii/cloudflare-helm-proxy).
 
@@ -19,33 +19,56 @@ We will provide updates as soon as more information becomes available.
 
 1. click the "Deploy With Workers" button
 2. follow the instructions to fork and deploy
-3. update routes as you requirement
+3. **配置路由**（见下节）—— 不配的话访问自己的域名会直接 `404 HOST_NOT_CONFIGURED`
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ciiiii/cloudflare-docker-proxy)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ga456rnet/cf-dproxy)
 
-## Routes configuration tutorial
+> ⚠️ 请使用**本仓库**的按钮。上游 `ciiiii/cloudflare-docker-proxy` 的按钮点出来的是
+> 未打补丁的版本：缺 `main` 字段会部署失败、`[vars]` 写在 `[env.*]` 里会 522、
+> 没有 `library/` 前缀修复会导致群晖搜不到官方镜像。
 
-1. use cloudflare worker host: only support proxy one registry
-   ```javascript
-   const routes = {
-     "${workername}.${username}.workers.dev/": "https://registry-1.docker.io",
-   };
-   ```
-2. use custom domain: support proxy multiple registries route by host
-   - host your domain DNS on cloudflare
-   - add `A` record of xxx.example.com to `192.0.2.1`
-   - deploy this project to cloudflare workers
-   - add `xxx.example.com/*` to HTTP routes of workers
-   - add more records and modify the config as you need
-   ```javascript
-   const routes = {
-     "docker.libcuda.so": "https://registry-1.docker.io",
-     "quay.libcuda.so": "https://quay.io",
-     "gcr.libcuda.so": "https://k8s.gcr.io",
-     "k8s-gcr.libcuda.so": "https://k8s.gcr.io",
-     "ghcr.libcuda.so": "https://ghcr.io",
-   };
-   ```
+## Routes configuration（路由表）
+
+决定「哪个主机名 → 哪个上游 registry」。**用环境变量配，不用改源码。**
+
+| 变量 | 说明 |
+|---|---|
+| `REGISTRY_ROUTES` | `host=upstream,host=upstream`，也接受 JSON。键支持精确主机名或 `*.example.com` 通配（匹配任意子域，**不含**裸域）；值必须带 `https://` |
+| `DEFAULT_UPSTREAM` | 没有任何路由命中时的兜底上游。给"只用 `xxx.workers.dev`、只代理一个 registry"的场景用 |
+
+**都不配**时回落到内置表（`*.aburling.dpdns.org` 那套），所以老部署行为不变。
+
+例 1 —— 有自有域名，代理两个 registry：
+
+```toml
+[vars]
+REGISTRY_ROUTES = "docker.example.com=https://registry-1.docker.io,ghcr.example.com=https://ghcr.io"
+```
+
+例 2 —— 没有域名，只有 `xxx.workers.dev`，只代理 Docker Hub：
+
+```toml
+[vars]
+DEFAULT_UPSTREAM = "https://registry-1.docker.io"
+```
+
+然后在面板 **Settings → Domains & Routes → Add → Custom Domain** 里逐个绑定上面用到的主机名。
+
+> ⚠️ `wrangler.toml` 里的 `CUSTOM_DOMAIN` 是**死变量**（代码里从没读过它），别拿它当路由配置。
+> 真正生效的只有内置表 / `REGISTRY_ROUTES` / `DEFAULT_UPSTREAM` 三者。
+
+<details>
+<summary>老做法（HTTP Route + 占位 A 记录）</summary>
+
+1. host your domain DNS on cloudflare
+2. add `A` record of xxx.example.com to `192.0.2.1`
+3. deploy this project to cloudflare workers
+4. add `xxx.example.com/*` to HTTP routes of workers
+5. add more records and modify the config as you need
+
+⚠️ 这套和 Custom Domain **二选一**，同时用会报 `domain already in use`。
+
+</details>
 
 
 ---
@@ -70,6 +93,19 @@ We will provide updates as soon as more information becomes available.
 # 方式 B：命令行
 npx wrangler secret put AUTH_USERS --env production
 ```
+
+> ⚠️ **误配时是 fail-open，不是 fail-closed。**
+> `AUTH_ENABLED=true` 但 `AUTH_USERS` 为空/不可解析时，代码**不拦截任何请求**
+> （行为退回"没有门禁"）并打一条 `console.warn`。
+> 原因：那种情况下凭据表是空表，fail-closed 会把**运维自己**也锁在外面且无后门。
+> ⇒ **部署后务必确认 `AUTH_USERS` 真的配上了**，否则你以为有门禁、其实是裸奔。
+> 三态自检：
+>
+> | 状态 | `/v2/` 无凭据 | `/v2/auth` 无凭据 |
+> |---|---|---|
+> | 鉴权关闭 | `401` + `Bearer` | `200` + `eyJ…` |
+> | **门禁生效** ✅ | `401` + **`Basic`** | **`401`** |
+> | 误配 fail-open ⚠️ | `401` + `Bearer` | `200` + `dpx…` |
 
 客户端怎么填：
 
