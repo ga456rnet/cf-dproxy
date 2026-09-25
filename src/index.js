@@ -37,6 +37,23 @@ addEventListener("fetch", (event) => {
 const dockerHub = "https://registry-1.docker.io";
 
 // ---------------------------------------------------------------------------
+// [4] 搜索上游候选列表（按顺序尝试，第一个成功即采用）
+//
+// 为什么需要多个：Docker Hub 的 Web 搜索 API 按 **出口 IP** 限流
+// （实测响应头 x-ratelimit-limit: 180，即 180 次/小时/IP）。
+// Cloudflare Worker 的出口 IP 是被海量 Worker 共享的，
+// 实测从 Worker 发出的请求 **100% 返回 429 Rate limit exceeded**（连打 20 次全是 429）。
+// registry.hub.docker.com 是 Docker 的旧主机名，数据完全相同，
+// 但独立域名往往对应独立的限流桶 —— 放在第二个试。
+// 两个都挂时，走 probeRepoName() 用 registry 协议做精确名校验兜底。
+// ---------------------------------------------------------------------------
+const SEARCH_UPSTREAMS = [
+  "https://hub.docker.com/v2/search/repositories/",
+  "https://registry.hub.docker.com/v2/search/repositories/",
+];
+
+
+// ---------------------------------------------------------------------------
 // [1] 安全读取部署变量：未注入时返回默认值，绝不抛 ReferenceError
 //     （typeof 作用于未声明的标识符是安全的，不会抛错）
 // ---------------------------------------------------------------------------
@@ -167,82 +184,97 @@ async function handleRequestInner(request) {
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
     // ?debug=1 —— 把上游诊断信息带进响应，便于排查"搜索返回 0 条"
     const debug = url.searchParams.get("debug") === "1";
-    const diag = {
-      upstreamUrl: null,
-      upstreamStatus: null,
-      upstreamBody: null,
-      upstreamError: null,
-      upstreamErrorName: null,
-      rawCount: null,
-      elapsedMs: null,
-    };
+    const diag = { attempts: [], resolvedBy: null };
+
+    let results = null;
+    let total = 0;
 
     // 只有 Docker Hub 有公开搜索 API。其他上游（ghcr/quay/gcr/ecr...）
     // 一律返回空结果 —— 让 UI 显示"无结果"，而不是"查询注册表失败"。
     if (q && isDockerHub) {
-      const t0 = Date.now();
-      try {
-        const searchUrl =
-          "https://hub.docker.com/v2/search/repositories/?query=" +
-          encodeURIComponent(q) +
-          "&page_size=" +
-          n +
-          "&page=" +
-          page;
-        diag.upstreamUrl = searchUrl;
-        const resp = await fetchWithTimeout(
-          searchUrl,
-          {
-            method: "GET",
-            headers: {
-              accept: "application/json",
-              "user-agent": "cf-docker-proxy-search/1.0",
-            },
-            redirect: "follow",
-          },
-          8000
-        );
-        diag.upstreamStatus = resp.status;
-        if (resp.ok) {
-          const data = await resp.json();
-          diag.rawCount =
-            data && typeof data.count === "number" ? data.count : null;
-          const list = Array.isArray(data && data.results) ? data.results : [];
-          const results = list
-            .map((it) => ({
-              name: it.repo_name || "",
-              description: it.short_description || "",
-              star_count: it.star_count || 0,
-              is_official: !!it.is_official,
-              is_automated: false,
-            }))
-            .filter((it) => it.name !== "");
-          diag.elapsedMs = Date.now() - t0;
-          const body = {
-            num_results:
-              typeof data.count === "number" ? data.count : results.length,
-            query: q,
-            results: results,
-          };
-          if (debug) body.debug = diag;
-          return new Response(JSON.stringify(body), {
-            status: 200,
-            headers: { "content-type": "application/json; charset=utf-8" },
-          });
-        }
-        // 非 2xx：把上游响应体前 300 字符留作诊断
+      // ---- 1) 依次尝试各搜索上游 ----
+      const qs = `?query=${encodeURIComponent(q)}&page_size=${n}&page=${page}`;
+      for (const base of SEARCH_UPSTREAMS) {
+        const target = base + qs;
+        const rec = { url: target, status: null, body: null, error: null };
+        diag.attempts.push(rec);
         try {
-          diag.upstreamBody = (await resp.text()).slice(0, 300);
+          const resp = await fetchWithTimeout(
+            target,
+            {
+              method: "GET",
+              headers: {
+                accept: "application/json",
+                "user-agent": "cf-docker-proxy-search/1.0",
+              },
+              redirect: "follow",
+            },
+            8000
+          );
+          rec.status = resp.status;
+          if (resp.ok) {
+            const data = await resp.json();
+            const list = Array.isArray(data && data.results) ? data.results : [];
+            results = list
+              .map((it) => ({
+                name: it.repo_name || "",
+                description: it.short_description || "",
+                star_count: it.star_count || 0,
+                is_official: !!it.is_official,
+                is_automated: false,
+              }))
+              .filter((it) => it.name !== "");
+            total = typeof data.count === "number" ? data.count : results.length;
+            diag.resolvedBy = target;
+            break;
+          }
+          try {
+            rec.body = (await resp.text()).slice(0, 200);
+          } catch (e) {
+            /* ignore */
+          }
         } catch (e) {
-          /* ignore */
+          rec.error = (e && e.message) || String(e);
         }
-      } catch (e) {
-        diag.upstreamError = e && e.message ? e.message : String(e);
-        diag.upstreamErrorName = e && e.name ? e.name : null;
       }
-      diag.elapsedMs = Date.now() - t0;
+
+      // ---- 2) 搜索上游全挂 → 用 registry 协议校验精确仓库名 ----
+      //   能覆盖"用户已经知道镜像名，只想在 UI 里把它拉下来"这个真实场景。
+      //   例：输入 `vaultwarden/server` → 命中；输入 `redis` → 命中 library/redis。
+      if (results === null) {
+        const candidates = q.includes("/") ? [q] : ["library/" + q, q];
+        const found = [];
+        for (const name of candidates) {
+          const rec = { probe: name, exists: false, tagCount: null, error: null };
+          diag.attempts.push(rec);
+          try {
+            const info = await probeRepoName(name);
+            rec.exists = info.exists;
+            rec.tagCount = info.tags ? info.tags.length : null;
+            if (info.exists) {
+              const sample = info.tags && info.tags.length ? info.tags.slice(0, 8) : [];
+              found.push({
+                name: name,
+                description: sample.length
+                  ? "精确名匹配 · 部分标签: " + sample.join(", ")
+                  : "精确名匹配（该仓库无标签列表）",
+                star_count: 0,
+                is_official: name.startsWith("library/"),
+                is_automated: false,
+              });
+            }
+          } catch (e) {
+            rec.error = (e && e.message) || String(e);
+          }
+        }
+        results = found;
+        total = found.length;
+        if (found.length) diag.resolvedBy = "registry-name-probe";
+      }
     }
-    const body = { num_results: 0, query: q, results: [] };
+
+    if (results === null) results = [];
+    const body = { num_results: total, query: q, results: results };
     if (debug) body.debug = diag;
     return new Response(JSON.stringify(body), {
       status: 200,
@@ -339,6 +371,51 @@ function fetchWithTimeout(input, init, ms) {
   const timer = setTimeout(() => controller.abort(), ms);
   const opts = Object.assign({}, init || {}, { signal: controller.signal });
   return fetch(input, opts).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// [4] 用 registry 协议校验"某个仓库名在 Docker Hub 上是否存在"
+//
+// 走的是和 pull 完全相同的接口（/v2/ 挑战 → token → tags/list），
+// 因此不受 hub.docker.com 那套 Web API 限流影响。
+//
+// 返回 { exists: boolean, tags: string[]|null }
+// ---------------------------------------------------------------------------
+async function probeRepoName(name) {
+  const base = "https://registry-1.docker.io";
+  const challenge = await fetch(base + "/v2/", {
+    method: "GET",
+    redirect: "follow",
+  });
+  if (challenge.status !== 401) return { exists: false, tags: null };
+
+  const authStr = challenge.headers.get("WWW-Authenticate");
+  if (!authStr) return { exists: false, tags: null };
+
+  const wa = parseAuthenticate(authStr);
+  const tokResp = await fetchToken(wa, `repository:${name}:pull`, null);
+  if (!tokResp.ok) return { exists: false, tags: null };
+
+  const tokJson = await tokResp.json();
+  const token = tokJson.token || tokJson.access_token;
+  if (!token) return { exists: false, tags: null };
+
+  // ?n=10 —— OCI 分发规范的分页参数，Docker Hub 支持；不支持时会被忽略
+  const r = await fetch(`${base}/v2/${name}/tags/list?n=10`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+    redirect: "follow",
+  });
+  if (r.status !== 200) return { exists: false, tags: null };
+
+  let tags = null;
+  try {
+    const d = await r.json();
+    tags = Array.isArray(d && d.tags) ? d.tags : null;
+  } catch (e) {
+    /* 200 但 body 不可解析 —— 仍然算存在 */
+  }
+  return { exists: true, tags: tags };
 }
 
 function parseAuthenticate(authenticateStr) {
