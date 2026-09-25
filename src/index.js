@@ -614,12 +614,37 @@ async function handleRequestInner(request, event) {
       .slice("/v1/repositories/".length)
       .replace(/\/tags\/?$/, "")
       .replace(/^\/+|\/+$/g, "");
+    // -------------------------------------------------------------------------
+    // 【关键修复 2026-09-25】裸名必须补 `library/` 前缀 —— 和下面 /v2 那条补全
+    // 是同一件事，但这里原来漏了，直接导致群晖报「没有标签提供下载」。
+    //
+    // 实测证据（线上，修复前）：
+    //   /v2/nginx/tags/list          -> 301     ← 群晖不跟随重定向
+    //   /v1/repositories/nginx/tags  -> 200 []  ← 空数组 = 界面显示"没有标签"
+    //   /v1/repositories/library/nginx/tags -> 200 [{"name":"1"},{"name":"1-alpine"},...]
+    //
+    // 原因：Docker Hub 上官方镜像的真实仓库名是 `library/nginx`，
+    //   拿裸名 `nginx` 去 probeRepoName() 必然 404 → tags=null → 返回 []。
+    //   而群晖搜索结果里官方镜像显示的就是**裸名**（nginx / redis / ubuntu ...），
+    //   所以这条路径是它的必经之路，不补前缀就等于官方镜像全都没标签。
+    //
+    // 顺序：裸名（不含 `/`）几乎只可能是官方镜像，先试 `library/<name>`，
+    //   再试裸名兜底（万一将来 Docker Hub 支持了顶层裸名仓库）。
+    // -------------------------------------------------------------------------
+    const candidates = rawName.includes("/")
+      ? [rawName]
+      : ["library/" + rawName, rawName];
     let tags = null;
-    try {
-      const info = await probeRepoName(rawName, 100);
-      if (info.exists && Array.isArray(info.tags)) tags = info.tags;
-    } catch (e) {
-      /* 吞掉 —— 兜底接口不能把请求变成 500 */
+    for (const name of candidates) {
+      try {
+        const info = await probeRepoName(name, 100);
+        if (info.exists && Array.isArray(info.tags) && info.tags.length) {
+          tags = info.tags;
+          break;
+        }
+      } catch (e) {
+        /* 吞掉 —— 兜底接口不能把请求变成 500 */
+      }
     }
     if (tags === null) {
       // 空数组而不是 404：DSM 拿到 404 会报错，拿到 [] 只会显示"无标签"
@@ -715,15 +740,31 @@ async function handleRequestInner(request, event) {
     }
     return await fetchToken(wwwAuthenticate, scope, authorization);
   }
-  // redirect for DockerHub library images
+  // ---------------------------------------------------------------------------
+  // DockerHub 官方镜像的 `library/` 补全 —— 【内部改写，不再返回 301】
   // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
-  if (isDockerHub) {
+  //
+  // 为什么从 `Response.redirect(..., 301)` 改成改写 pathname（2026-09-25 实测）：
+  //
+  //   群晖 Container Manager 请求 /v2/nginx/tags/list 拿到 **301 后不会跟随**，
+  //   而是判定"取不到标签"→ 回落到 V1 兜底 → 兜底也拿不到就报
+  //   「没有标签提供下载」。而 DSM 搜索结果里官方镜像显示的就是**裸名**
+  //   （nginx / redis / ubuntu ...），所以这条路径是它的必经之路。
+  //
+  //   内部改写后 /v2/nginx/tags/list 直接返回 200 + 真实 tags，
+  //   完全不依赖客户端会不会跟随重定向。
+  //
+  // 对 docker CLI 无影响：它本来就会自己把 `nginx` 规范化成 `library/nginx`
+  //   （基本不会走到这里），而且收到 200 比收到 301 更好。
+  //
+  // ⚠️ 改写必须发生在 `pullScopeFromPath()` 之前 —— 它靠 pathname 推导
+  //    `repository:<name>:pull` 换票作用域。改写后 name 才是正确的 `library/nginx`。
+  // ---------------------------------------------------------------------------
+  if (isDockerHub && url.pathname.startsWith("/v2/")) {
     const pathParts = url.pathname.split("/");
     if (pathParts.length == 5) {
       pathParts.splice(2, 0, "library");
-      const redirectUrl = new URL(url);
-      redirectUrl.pathname = pathParts.join("/");
-      return Response.redirect(redirectUrl, 301);
+      url.pathname = pathParts.join("/");
     }
   }
   // foward requests
