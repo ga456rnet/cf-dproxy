@@ -408,51 +408,23 @@ async function handleRequestInner(request, event) {
   }
 
   // ---------------------------------------------------------------------------
-  // DSM 每次搜索前都会先 GET /v2/_catalog（实测请求记录证实）。
-  // 原来这条会透传给 registry-1.docker.io，而 Docker Hub 不对匿名开放目录，
-  // 于是返回 401 —— 让 DSM 的浏览视图报错。
-  // 这里给 Docker Hub 返回一份「官方镜像清单」当目录；任何失败都降级为
-  // 空目录 + 200。**永远不再返回 401。**
-  // 只对 Docker Hub 生效，其他上游保持原样透传（最小改动面）。
+  // 【故意不拦截 /v2/_catalog —— 这里是踩过的坑，别再改回去】
+  //
+  // DSM 每次搜索前都会先 GET /v2/_catalog。实测（2026-09-25 11:54 截图 + 11:39 日志对照）：
+  //
+  //   _catalog 返回 401（本代理默认行为，透传给 registry-1.docker.io）
+  //     -> DSM 走 /v1/search，界面显示搜索结果            ✅ 搜索可用
+  //
+  //   _catalog 返回 200（曾"好心"返回官方镜像清单）
+  //     -> DSM 切换到「目录浏览」模式，**把 catalog 当镜像列表显示，
+  //        搜索框完全不参与过滤**，搜什么都是那 100 条官方镜像   ❌ 搜索失效
+  //
+  // 所以：**必须让 /v2/_catalog 保持 401**，DSM 才会用 /v1/search。
+  // Docker Hub 本来就不对匿名开放目录，401 是符合协议的真实响应，不是缺陷。
+  //
+  // （Docker Hub 有上百万个仓库，catalog 在语义上也不可能列全，
+  //   靠它来"搜索"从根上就不成立。）
   // ---------------------------------------------------------------------------
-  if (url.pathname === "/v2/_catalog" && isDockerHub) {
-    const emptyCatalog = () =>
-      new Response(JSON.stringify({ repositories: [] }), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-    try {
-      const resp = await fetchWithTimeout(
-        "https://registry.hub.docker.com/v2/repositories/library/?page_size=100",
-        {
-          method: "GET",
-          headers: {
-            accept: "application/json",
-            "user-agent": "cf-docker-proxy-search/1.0",
-          },
-          redirect: "follow",
-        },
-        8000
-      );
-      if (!resp.ok) return emptyCatalog();
-      const data = await resp.json();
-      const list = Array.isArray(data && data.results) ? data.results : [];
-      const repositories = list
-        .map((it) => {
-          const ns = it.namespace || "library";
-          const nm = it.name || "";
-          if (!nm) return "";
-          return nm.includes("/") ? nm : ns + "/" + nm;
-        })
-        .filter((s) => s !== "");
-      return new Response(JSON.stringify({ repositories: repositories }), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-    } catch (e) {
-      return emptyCatalog();
-    }
-  }
 
   if (url.pathname == "/v2/") {
     const newUrl = new URL(upstream + "/v2/");
