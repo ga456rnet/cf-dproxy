@@ -19,6 +19,12 @@
  *
  * [3] handleRequest 全程 try/catch，异常返回 500 + 错误详情，便于定位。
  *
+ * [4] 新增 DSM / Portainer 等 UI 的「搜索注册表」兼容层（/v1/search）。
+ *     这些 UI 的搜索框走 Docker Hub 旧版搜索 API，而本代理只实现 Registry
+ *     协议（/v2/*），原本会落到路由兜底返回 `404 page not found`，
+ *     UI 表现为「查询注册表失败」。详见 handleRequestInner 里的 /v1/search 分支。
+ *     —— 该兼容层**只影响搜索**，任何情况下都不影响 pull。
+ *
  * 兼容性：本文件仍使用 Service Worker 语法（addEventListener），
  * 与仓库现有 wrangler.toml（无 main 字段、compatibility_date = 2023-12-01）保持一致，
  * 部署命令无需改动。
@@ -128,6 +134,99 @@ async function handleRequestInner(request) {
   }
   const isDockerHub = upstream == dockerHub;
   const authorization = request.headers.get("Authorization");
+
+  // ---------------------------------------------------------------------------
+  // [4] DSM / Portainer 等 UI 的「搜索注册表」兼容层
+  //
+  // 背景：DSM「Container Manager → 注册表」的搜索框调的是 Docker Hub **旧版**
+  //   搜索 API `GET /v1/search?q=&n=`，而本代理只实现 Registry 协议（/v2/*），
+  //   所以请求会落到路由兜底 → `404 page not found`（text/plain），
+  //   DSM 界面表现为「查询注册表失败」。
+  //
+  // 做法：把 /v1/search 映射到 Docker Hub **现行**公开搜索 API
+  //   https://hub.docker.com/v2/search/repositories/?query=&page_size=
+  //   并把字段改名成旧版格式（repo_name→name、short_description→description、
+  //   count→num_results）。
+  //
+  // 实测要点（2026-09-25）：
+  //   - 官方镜像上游返回的是**裸名**：`nginx`、`redis`（is_official=true）
+  //   - 第三方镜像返回 `命名空间/仓库`：`vaultwarden/server`
+  //   两者都**原样透传**。裸名交给下面已有的「DockerHub library 补全重定向」
+  //   处理（/v2/nginx/manifests/latest → /v2/library/nginx/manifests/latest），
+  //   因此不需要在这里补 `library/`，UI 里显示的名字也更友好。
+  //
+  // 安全边界：搜索是「锦上添花」，**绝不能拖累 pull**。
+  //   所以任何异常/非 200/超时都吞掉，返回 200 + 空结果，
+  //   让 UI 显示"无结果"而不是报错。
+  // ---------------------------------------------------------------------------
+  if (url.pathname === "/v1/search" || url.pathname === "/v1/search/") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const nRaw = parseInt(url.searchParams.get("n") || "25", 10);
+    const n = Number.isFinite(nRaw) ? Math.min(Math.max(nRaw, 1), 100) : 25;
+    const pageRaw = parseInt(url.searchParams.get("page") || "1", 10);
+    const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+
+    // 只有 Docker Hub 有公开搜索 API。其他上游（ghcr/quay/gcr/ecr...）
+    // 一律返回空结果 —— 让 UI 显示"无结果"，而不是"查询注册表失败"。
+    if (q && isDockerHub) {
+      try {
+        const searchUrl =
+          "https://hub.docker.com/v2/search/repositories/?query=" +
+          encodeURIComponent(q) +
+          "&page_size=" +
+          n +
+          "&page=" +
+          page;
+        const resp = await fetchWithTimeout(
+          searchUrl,
+          {
+            method: "GET",
+            headers: {
+              accept: "application/json",
+              "user-agent": "cf-docker-proxy-search/1.0",
+            },
+            redirect: "follow",
+          },
+          8000
+        );
+        if (resp.ok) {
+          const data = await resp.json();
+          const list = Array.isArray(data && data.results) ? data.results : [];
+          const results = list
+            .map((it) => ({
+              name: it.repo_name || "",
+              description: it.short_description || "",
+              star_count: it.star_count || 0,
+              is_official: !!it.is_official,
+              is_automated: false,
+            }))
+            .filter((it) => it.name !== "");
+          return new Response(
+            JSON.stringify({
+              num_results:
+                typeof data.count === "number" ? data.count : results.length,
+              query: q,
+              results: results,
+            }),
+            {
+              status: 200,
+              headers: { "content-type": "application/json; charset=utf-8" },
+            }
+          );
+        }
+      } catch (e) {
+        // 搜索上游失败：静默降级为空结果，不影响任何 pull 行为
+      }
+    }
+    return new Response(
+      JSON.stringify({ num_results: 0, query: q, results: [] }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      }
+    );
+  }
+
   if (url.pathname == "/v2/") {
     const newUrl = new URL(upstream + "/v2/");
     const headers = new Headers();
@@ -205,6 +304,18 @@ async function handleRequestInner(request) {
     return redirectResp;
   }
   return resp;
+}
+
+// ---------------------------------------------------------------------------
+// [4] 带超时的 fetch —— 仅用于搜索兼容层。
+//     搜索上游（hub.docker.com）若挂起，不能让 Worker 一直等，
+//     否则会耗尽请求预算并可能影响同期的 pull 请求。
+// ---------------------------------------------------------------------------
+function fetchWithTimeout(input, init, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  const opts = Object.assign({}, init || {}, { signal: controller.signal });
+  return fetch(input, opts).finally(() => clearTimeout(timer));
 }
 
 function parseAuthenticate(authenticateStr) {
