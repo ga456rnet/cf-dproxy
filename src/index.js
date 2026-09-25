@@ -145,6 +145,32 @@ function parseAuthUsers(raw) {
 }
 const AUTH_USERS_MAP = parseAuthUsers(AUTH_USERS_RAW);
 
+// ---------------------------------------------------------------------------
+// [7.1] 误配防御：AUTH_ENABLED=true 但 AUTH_USERS 为空/不可解析
+//
+// 没有这一层时的后果是**灾难性的**：凭据表为空 ⇒ checkAuth 对任何请求都返回
+// ok=false ⇒ **所有请求 401，包括运维自己**。而且代码里没有任何后门，
+// 只能去面板把 AUTH_ENABLED 改回 false 才能恢复。
+//
+// 对「防白嫖」这类场景（挡的是滥用，不是保护机密），误配应该**降级成"没有门禁"**
+// （= 与加鉴权之前完全一致），而不是"服务全死"。所以这里 fail-open。
+//
+// 可见性：misconfigured 时会打 warn（Cloudflare 面板 → Worker → Logs 可见），
+// 并且 /v2/auth 会**退回上游流程**（返回上游 token 而不是空 token），
+// 所以外部可以据此判断当前处于哪种状态：
+//   /v2/auth 无凭据 → 401         = 门禁已生效
+//   /v2/auth 无凭据 → 200 + eyJ…  = 鉴权关闭
+//   /v2/auth 无凭据 → 200 + dpx…  = 门禁生效但由本代理签发（正常）
+// ---------------------------------------------------------------------------
+const AUTH_MISCONFIGURED = AUTH_ON && AUTH_USERS_MAP.size === 0;
+const AUTH_GATE_ACTIVE = AUTH_ON && !AUTH_MISCONFIGURED;
+if (AUTH_MISCONFIGURED) {
+  console.warn(
+    "[cf-dproxy] AUTH_ENABLED=true 但 AUTH_USERS 为空或不可解析 —— 已 fail-open（不拦截任何请求）。" +
+      "请在面板配置 AUTH_USERS（Secret，格式 user1:pass1,user2:pass2）后重新部署。"
+  );
+}
+
 // 恒定时间比较 —— 避免用 `===` 逐字符短路比较泄露长度/前缀信息。
 function safeEqual(a, b) {
   const sa = String(a);
@@ -195,8 +221,11 @@ function decodeBasic(headerValue) {
 //   ok   —— 是否放行
 //   ours —— 这个 Authorization 头是"代理自己的凭据"（= 转发上游前必须删掉）
 // 鉴权关闭时一律放行，且 ours=false（保持原样透传，行为与改动前完全一致）。
+// 误配（AUTH_ENABLED=true 但 AUTH_USERS 为空）同样放行 —— 见上面 [7.1]。
 function checkAuth(request) {
-  if (!AUTH_ON) return { ok: true, ours: false, via: "off" };
+  if (!AUTH_GATE_ACTIVE) {
+    return { ok: true, ours: false, via: AUTH_MISCONFIGURED ? "misconfigured-open" : "off" };
+  }
 
   const h = request.headers.get("Authorization");
   if (!h) return { ok: false, ours: false, via: null };
@@ -700,8 +729,13 @@ async function handleRequestInner(request, event) {
     //
     // 走到这里说明客户端**已经**通过了 checkAuth（否则上面就 401 了），
     // 所以直接回我们自己的令牌。令牌 = AUTH_TOKEN（未配置时由 AUTH_USERS 派生）。
+    //
+    // ⚠️ 判据用 AUTH_GATE_ACTIVE 而不是 AUTH_ON：
+    //    误配（AUTH_ENABLED=true 但 AUTH_USERS 为空）时 AUTH_TOKEN_ISSUED 是空串，
+    //    若照旧短路就会**返回一个空 token**，客户端会把它当有效令牌缓存起来。
+    //    误配时退回下面的上游流程，行为与"鉴权关闭"完全一致。
     // -------------------------------------------------------------------------
-    if (AUTH_ON) {
+    if (AUTH_GATE_ACTIVE) {
       return new Response(
         JSON.stringify({
           token: AUTH_TOKEN_ISSUED,

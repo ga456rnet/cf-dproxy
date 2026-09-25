@@ -220,3 +220,7 @@ dist
 *.orig
 # 探针/临时产物
 _probe/
+
+### 凭据台账（含明文密码，绝不提交）###
+creds-ledger*.json
+creds-ledger*.json.tmp

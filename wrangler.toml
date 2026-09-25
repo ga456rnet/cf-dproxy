@@ -47,7 +47,13 @@ CUSTOM_DOMAIN = "aburling.dpdns.org"
 # 另：仓库 public 意味着"藏地址"这条路本来就走不通，
 #    所以鉴权是**唯一**能防白嫖的手段 —— 一旦决定不公开给别人用，就把
 #    AUTH_ENABLED 设成 "true" 并配上 AUTH_USERS。
-AUTH_ENABLED = "false"   # 总开关；默认关 = 部署后行为与改动前完全一致
+#
+# 【误配防御（2026-09-25 新增）】
+#  AUTH_ENABLED="true" 但 AUTH_USERS 为空/不可解析时，代码会 **fail-open**
+#  （不拦截任何请求，行为退回"没有门禁"），而不是把所有人都 401。
+#  原因：那种情况下凭据表是空表，会把**运维自己**也锁在外面，且代码里没有后门。
+#  所以"打开开关但忘了配凭据"不会造成服务中断，只会打一条 warn 日志。
+AUTH_ENABLED = "true"    # 总开关；⚠️ 生效前提是 AUTH_USERS 已配置（否则 fail-open）
 # AUTH_TOKEN = ""        # 可选：固定 Bearer 令牌。留空则由 AUTH_USERS 自动派生
 RATE_LIMIT_ENABLED = "true"
 RATE_LIMIT_PER_MIN = "600"  # 每 IP 每分钟；/blobs/ 自动 ×4（正常 pull 撞不到）
@@ -86,7 +92,7 @@ MODE = "production"
 TARGET_UPSTREAM = ""
 CUSTOM_DOMAIN = "aburling.dpdns.org"
 # ⚠️ wrangler 的 env.vars **不继承**顶层 [vars]，所以这里必须重复一遍。
-AUTH_ENABLED = "false"
+AUTH_ENABLED = "true"
 RATE_LIMIT_ENABLED = "true"
 RATE_LIMIT_PER_MIN = "600"
 
