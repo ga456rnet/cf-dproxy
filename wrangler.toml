@@ -59,6 +59,15 @@ CUSTOM_DOMAIN = "aburling.dpdns.org"   # ⚠️ 死变量：代码里从没读�
 #
 # 注：`CUSTOM_DOMAIN` 是上游遗留的死变量（代码没读过），别拿它当路由配置用。
 #     真正生效的只有内置表 / REGISTRY_ROUTES / DEFAULT_UPSTREAM 三者。
+#
+# 【本实例的实际配置（2026-09-25 起显式化）】
+#  下面这一串与 src/index.js 里的内置表**逐条等价**（已由
+#  verify/verify-routes-parity.js 证明行为一致，PASS 15/0），
+#  显式写出来的目的有两个：
+#    ① 证明"环境变量驱动"这条路径在真实 Cloudflare 上确实可用
+#       （沙箱绿 ≠ 部署绿）；
+#    ② 给要照着改的部署者一个可直接复制的样例。
+REGISTRY_ROUTES = "docker.aburling.dpdns.org=https://registry-1.docker.io,quay.aburling.dpdns.org=https://quay.io,gcr.aburling.dpdns.org=https://gcr.io,k8s-gcr.aburling.dpdns.org=https://k8s.gcr.io,k8s.aburling.dpdns.org=https://registry.k8s.io,ghcr.aburling.dpdns.org=https://ghcr.io,ecr.aburling.dpdns.org=https://public.ecr.aws,docker-staging.aburling.dpdns.org=https://registry-1.docker.io"
 
 # --- 访问控制（[7] 轻量鉴权 + 速率限制）---
 #
@@ -121,6 +130,8 @@ CUSTOM_DOMAIN = "aburling.dpdns.org"
 AUTH_ENABLED = "true"
 RATE_LIMIT_ENABLED = "true"
 RATE_LIMIT_PER_MIN = "600"
+# 同上：与顶层逐条等价（显式写出以便 --env production 部署也走 env 驱动路径）
+REGISTRY_ROUTES = "docker.aburling.dpdns.org=https://registry-1.docker.io,quay.aburling.dpdns.org=https://quay.io,gcr.aburling.dpdns.org=https://gcr.io,k8s-gcr.aburling.dpdns.org=https://k8s.gcr.io,k8s.aburling.dpdns.org=https://registry.k8s.io,ghcr.aburling.dpdns.org=https://ghcr.io,ecr.aburling.dpdns.org=https://public.ecr.aws,docker-staging.aburling.dpdns.org=https://registry-1.docker.io"
 
 [env.staging]
 name = "cloudflare-docker-proxy-staging"
