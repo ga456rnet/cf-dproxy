@@ -1,4 +1,26 @@
+# cf-dproxy — wrangler.toml (patched)
+#
+# 【修复 1】补上 main = "src/index.js"
+#   原配置没有 main 字段，`npx wrangler deploy` 会直接报：
+#     X [ERROR] Missing entry-point: The entry-point should be specified via
+#       the command line (e.g. `wrangler deploy path/to/script`) or the `main` config field.
+#   Cloudflare 面板的 Git 构建默认执行的就是不带位置参数的 `npx wrangler deploy`，
+#   因此这一项是让"基于仓库自动构建"真正跑通的前提。
+#
+# 【修复 2】把 MODE / TARGET_UPSTREAM 提到【顶层 [vars]】
+#
+# 原因：原配置只把它们放在 [env.production.vars] 里，wrangler 只有在显式带
+# `--env production` 时才会注入。而 Cloudflare 面板的 Git 集成、README 里的
+# "Deploy to Workers" 按钮走的都是不带 --env 的 `wrangler deploy`，
+# 结果线上 Worker 一个绑定都没有（实测输出 "No bindings found."），
+# 代码里读 MODE 就抛 ReferenceError → 被 passThroughOnException 兜到死源站 → 522。
+#
+# 放到顶层后，无论用哪种方式部署都能拿到这两个变量。
+# 注意：原文件里的 `[env.vars]` 是上游的笔误（会生成一个名为 "vars" 的环境），
+# 已改为标准的顶层 `[vars]`。
+
 name = "cloudflare-docker-proxy"
+main = "src/index.js"
 compatibility_date = "2023-12-01"
 
 [dev]
@@ -6,8 +28,11 @@ ip = "0.0.0.0"
 port = 8787
 local_protocol = "http"
 
-[env.vars]
-CUSTOM_DOMAIN = "libcuda.so"
+# --- 顶层 vars：任何部署方式都会注入 ---
+[vars]
+MODE = "production"
+TARGET_UPSTREAM = ""
+CUSTOM_DOMAIN = "aburling.dpdns.org"
 
 [env.dev.vars]
 MODE = "debug"
@@ -16,23 +41,32 @@ CUSTOM_DOMAIN = "exmaple.com"
 
 [env.production]
 name = "cloudflare-docker-proxy"
+
+# --- 自定义域：让 wrangler 直接托管域名绑定 ---
+# 二选一：
+#   A) 在 Cloudflare 面板手工加 Worker Custom Domain（当前做法），这里保持注释；
+#   B) 取消注释，由 wrangler 部署时自动创建/维护（推荐，能避免"域名绑了但路由表没配"的不一致）。
+# 注意：A 和 B 不要同时用，否则会报 "domain already in use"。
+#
 # routes = [
-#   { pattern = "docker.libcuda.so", custom_domain = true },
-#   { pattern = "quay.libcuda.so", custom_domain = true },
-#   { pattern = "gcr.libcuda.so", custom_domain = true },
-#   { pattern = "k8s-gcr.libcuda.so", custom_domain = true },
-#   { pattern = "k8s.libcuda.so", custom_domain = true },
-#   { pattern = "ghcr.libcuda.so", custom_domain = true },
-#   { pattern = "cloudsmith.libcuda.so", custom_domain = true },
+#   { pattern = "docker.aburling.dpdns.org",     custom_domain = true },
+#   { pattern = "quay.aburling.dpdns.org",       custom_domain = true },
+#   { pattern = "gcr.aburling.dpdns.org",        custom_domain = true },
+#   { pattern = "k8s-gcr.aburling.dpdns.org",    custom_domain = true },
+#   { pattern = "k8s.aburling.dpdns.org",        custom_domain = true },
+#   { pattern = "ghcr.aburling.dpdns.org",       custom_domain = true },
+#   { pattern = "cloudsmith.aburling.dpdns.org", custom_domain = true },
+#   { pattern = "ecr.aburling.dpdns.org",        custom_domain = true },
 # ]
 
 [env.production.vars]
 MODE = "production"
 TARGET_UPSTREAM = ""
+CUSTOM_DOMAIN = "aburling.dpdns.org"
 
 [env.staging]
 name = "cloudflare-docker-proxy-staging"
-# route = { pattern = "docker-staging.libcuda.so", custom_domain = true }
+# route = { pattern = "docker-staging.aburling.dpdns.org", custom_domain = true }
 
 [env.staging.vars]
 MODE = "staging"

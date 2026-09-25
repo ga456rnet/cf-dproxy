@@ -1,9 +1,45 @@
+/**
+ * cf-dproxy — Cloudflare Worker Docker registry proxy (patched)
+ *
+ * 相对原版的三处修复（详见 FIX-NOTES.md）：
+ *
+ * [1] 不再直接引用裸全局变量 MODE / TARGET_UPSTREAM。
+ *     wrangler 只有在 `deploy --env production` 时才会注入这两个变量
+ *     （已用 `wrangler deploy --dry-run` 实测验证：
+ *       带 --env production → MODE: "production" / TARGET_UPSTREAM: ""
+ *       不带 --env          → "No bindings found."）。
+ *     若用 Cloudflare 面板的 Git 集成 / "Deploy to Workers" 按钮部署，变量不会被注入，
+ *     此时 `MODE == "debug"` 会抛 `ReferenceError: MODE is not defined`。
+ *     这里改用 `typeof` 安全探测，变量缺失时回落到 production 语义。
+ *
+ * [2] 移除 `event.passThroughOnException()`。
+ *     本项目没有真实源站（DNS 记录是 README 要求的 192.0.2.1 占位地址）。
+ *     原版一旦抛异常，passThrough 会去连这个死地址，最终返回 Cloudflare 522
+ *     "Connection timed out"，把真正的报错信息完全掩盖 —— 这正是本次故障的现象。
+ *
+ * [3] handleRequest 全程 try/catch，异常返回 500 + 错误详情，便于定位。
+ *
+ * 兼容性：本文件仍使用 Service Worker 语法（addEventListener），
+ * 与仓库现有 wrangler.toml（无 main 字段、compatibility_date = 2023-12-01）保持一致，
+ * 部署命令无需改动。
+ */
+
 addEventListener("fetch", (event) => {
-  event.passThroughOnException();
   event.respondWith(handleRequest(event.request));
 });
 
 const dockerHub = "https://registry-1.docker.io";
+
+// ---------------------------------------------------------------------------
+// [1] 安全读取部署变量：未注入时返回默认值，绝不抛 ReferenceError
+//     （typeof 作用于未声明的标识符是安全的，不会抛错）
+// ---------------------------------------------------------------------------
+const RUNTIME_MODE =
+  typeof MODE !== "undefined" && MODE !== null ? String(MODE) : "production";
+const RUNTIME_TARGET_UPSTREAM =
+  typeof TARGET_UPSTREAM !== "undefined" && TARGET_UPSTREAM !== null
+    ? String(TARGET_UPSTREAM)
+    : "";
 
 const routes = {
   // production
@@ -24,25 +60,69 @@ function routeByHosts(host) {
   if (host in routes) {
     return routes[host];
   }
-  if (MODE == "debug") {
-    return TARGET_UPSTREAM;
+  if (RUNTIME_MODE === "debug") {
+    return RUNTIME_TARGET_UPSTREAM;
   }
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// [3] 异常兜底：把 Worker 内部错误变成可读的 500，而不是 522
+// ---------------------------------------------------------------------------
 async function handleRequest(request) {
+  try {
+    return await handleRequestInner(request);
+  } catch (err) {
+    let host = "";
+    try {
+      host = new URL(request.url).hostname;
+    } catch (e) {
+      /* ignore */
+    }
+    return new Response(
+      JSON.stringify(
+        {
+          error: "WORKER_EXCEPTION",
+          message: err && err.message ? err.message : String(err),
+          host: host,
+          mode: RUNTIME_MODE,
+          hint: "Worker 内部抛异常。若 message 含 'is not defined'，说明该部署缺少对应环境变量。",
+        },
+        null,
+        2
+      ),
+      {
+        status: 500,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      }
+    );
+  }
+}
+
+async function handleRequestInner(request) {
   const url = new URL(request.url);
   if (url.pathname == "/") {
     return Response.redirect(url.protocol + "//" + url.host + "/v2/", 301);
   }
   const upstream = routeByHosts(url.hostname);
   if (upstream === "") {
+    // 主机名不在 routes 表里 —— 这就是"自定义域 404"的来源
     return new Response(
-      JSON.stringify({
-        routes: routes,
-      }),
+      JSON.stringify(
+        {
+          error: "HOST_NOT_CONFIGURED",
+          message:
+            "该主机名不在 Worker 的 routes 表中。请把自定义域的主机名加入 src/index.js 的 routes，" +
+            "或在 wrangler.toml 里为它配置 route/custom_domain。",
+          receivedHost: url.hostname,
+          routes: routes,
+        },
+        null,
+        2
+      ),
       {
         status: 404,
+        headers: { "content-type": "application/json; charset=utf-8" },
       }
     );
   }
@@ -158,7 +238,7 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
 
 function responseUnauthorized(url) {
   const headers = new Headers();
-  if (MODE == "debug") {
+  if (RUNTIME_MODE === "debug") {
     headers.set(
       "Www-Authenticate",
       `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
