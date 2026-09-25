@@ -408,6 +408,37 @@ async function handleRequestInner(request, event) {
   }
 
   // ---------------------------------------------------------------------------
+  // [6] Registry V1 兜底：/v1/repositories/<name>/tags
+  //
+  // 这是 DSM 在 /v2/<name>/tags/list 失败后的**降级路径**（实测日志坐实）。
+  // 上游 V1 已下线（410 Gone），所以这里用 V2 接口自己拼 V1 格式的响应。
+  //
+  // 只在 Docker Hub 上游生效 —— 其他上游（ghcr/quay/...）本来就没有 V1 语义，
+  // 硬造一个反而会误导客户端。
+  //
+  // 兜底原则：任何失败都不抛错，返回可解析的空数组，让 UI 显示"无标签"
+  // 而不是"查询注册表失败"（和 /v1/search 的处理思路一致）。
+  // ---------------------------------------------------------------------------
+  if (isDockerHub && /^\/v1\/repositories\/.+\/tags\/?$/.test(url.pathname)) {
+    const rawName = url.pathname
+      .slice("/v1/repositories/".length)
+      .replace(/\/tags\/?$/, "")
+      .replace(/^\/+|\/+$/g, "");
+    let tags = null;
+    try {
+      const info = await probeRepoName(rawName, 100);
+      if (info.exists && Array.isArray(info.tags)) tags = info.tags;
+    } catch (e) {
+      /* 吞掉 —— 兜底接口不能把请求变成 500 */
+    }
+    if (tags === null) {
+      // 空数组而不是 404：DSM 拿到 404 会报错，拿到 [] 只会显示"无标签"
+      return registryV1TagsResponse([]);
+    }
+    return registryV1TagsResponse(tags);
+  }
+
+  // ---------------------------------------------------------------------------
   // 【故意不拦截 /v2/_catalog —— 这里是踩过的坑，别再改回去】
   //
   // DSM 每次搜索前都会先 GET /v2/_catalog。实测（2026-09-25 11:54 截图 + 11:39 日志对照）：
@@ -489,7 +520,47 @@ async function handleRequestInner(request, event) {
     // don't follow redirect to dockerhub blob upstream
     redirect: isDockerHub ? "manual" : "follow",
   });
-  const resp = await fetch(newReq);
+  let resp = await fetch(newReq);
+
+  // ---------------------------------------------------------------------------
+  // [5] 【服务端匿名换票】—— 修群晖 Container Manager「下载时查询注册表失败」
+  //
+  // 实测（2026-09-25 请求日志 + 时间戳，证据在 SYNOLOGY-TROUBLESHOOT.md 附录 K）：
+  //   04:05:19.651 GET /v2/vaultwarden/server/tags/list      auth=False   ← DSM
+  //   04:05:20.943 GET /v1/repositories/vaultwarden/server/tags          ← 1.29s 后降级
+  //   04:10:42.438 GET /v2/apursuer/vaultwarden/tags/list    auth=False
+  //   04:10:43.668 GET /v1/repositories/apursuer/vaultwarden/tags        ← 1.23s 后降级
+  //
+  //   两条关键事实：
+  //     a) DSM 全程**没有**请求过 /v2/auth。日志里的 /v2/auth 全是本地 curl 探针
+  //        （UA=curl/8.13.0），DSM 的请求 UA 是空串。
+  //        => DSM **不做 Bearer 换票**：匿名请求 tags/list → 拿 401 → 直接放弃。
+  //     b) DSM 的降级路径是 Registry V1 API `/v1/repositories/<name>/tags`，
+  //        而 V1 早已下线：registry.hub.docker.com/v1/... 现在返回 **410 Gone**。
+  //        => 降级路径也是死的，两条路全断 → 界面报「查询注册表失败」。
+  //
+  //   所以把 401 body 写得更"标准"是**没用**的（DSM 根本不解析它），
+  //   正确做法是**由代理替客户端换票**：
+  //     上游 401 → 读它的 WWW-Authenticate → 匿名换 pull token → 带 token 重试 → 200
+  //   客户端全程看不到 401，自然不需要它有换票能力。
+  //
+  // 边界（三条，缺一不可）：
+  //   1) 只在客户端**没带** Authorization 时注入。带了就说明客户端自己会换票
+  //      （docker CLI 就是），保持标准 401 挑战流程，别抢它的活。
+  //   2) **作用域只限 scoped 路径**（manifests / blobs / tags）。`/v2/` 与
+  //      `/v2/_catalog` 的 `pullScopeFromPath()` 返回 null → 自动排除。
+  //      尤其 _catalog 一旦返回 200，DSM 会切到「目录浏览」模式、搜索框失效 ——
+  //      这个坑踩过一次了（见上面那段注释），所以这里必须让它继续 401。
+  //   3) 换票或重试失败 → 原样退回标准 401，不吞错误。
+  // ---------------------------------------------------------------------------
+  if (resp.status === 401 && !authorization) {
+    const pullScope = pullScopeFromPath(url.pathname);
+    if (pullScope) {
+      const injected = await retryWithAnonymousToken(newReq, resp, pullScope);
+      if (injected) resp = injected;
+    }
+  }
+
   if (resp.status == 401) {
     return responseUnauthorized(url);
   }
@@ -525,7 +596,8 @@ function fetchWithTimeout(input, init, ms) {
 //
 // 返回 { exists: boolean, tags: string[]|null }
 // ---------------------------------------------------------------------------
-async function probeRepoName(name) {
+async function probeRepoName(name, limit) {
+  const n = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 100) : 10;
   const base = "https://registry-1.docker.io";
   const challenge = await fetch(base + "/v2/", {
     method: "GET",
@@ -545,7 +617,7 @@ async function probeRepoName(name) {
   if (!token) return { exists: false, tags: null };
 
   // ?n=10 —— OCI 分发规范的分页参数，Docker Hub 支持；不支持时会被忽略
-  const r = await fetch(`${base}/v2/${name}/tags/list?n=10`, {
+  const r = await fetch(`${base}/v2/${name}/tags/list?n=${n}`, {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
     redirect: "follow",
@@ -560,6 +632,86 @@ async function probeRepoName(name) {
     /* 200 但 body 不可解析 —— 仍然算存在 */
   }
   return { exists: true, tags: tags };
+}
+
+// ---------------------------------------------------------------------------
+// [5] 从 registry 路径推导 pull scope
+//
+//   /v2/<name...>/manifests/<ref>   -> repository:<name>:pull
+//   /v2/<name...>/blobs/<digest>    -> repository:<name>:pull
+//   /v2/<name...>/tags/list         -> repository:<name>:pull
+//   /v2/                            -> null   （无 scope，故意不注入）
+//   /v2/_catalog                    -> null   （故意不注入，见上面 _catalog 那段注释）
+//
+// 注意：官方镜像的 `library/` 前缀由上面已有的 301 补全重定向处理
+// （`/v2/busybox/tags/list` 5 段 → `/v2/library/busybox/tags/list`），
+// 所以这里拿到的 name 已经是可直接喂给 auth 服务的正确形式。
+// ---------------------------------------------------------------------------
+function pullScopeFromPath(pathname) {
+  const parts = pathname.split("/").filter((s) => s !== "");
+  if (parts.length < 2 || parts[0] !== "v2") return null;
+  const idx = parts.findIndex(
+    (s, i) => i >= 1 && (s === "manifests" || s === "blobs" || s === "tags")
+  );
+  if (idx < 2) return null;
+  const name = parts.slice(1, idx).join("/");
+  if (!name) return null;
+  return `repository:${name}:pull`;
+}
+
+// ---------------------------------------------------------------------------
+// [5] 用匿名 token 重试一次上游请求
+//
+// 给「不做 Bearer 换票的客户端」用（群晖 Container Manager 就是这类）。
+// 返回重试后的 Response；任何一步不成功都返回 null，由调用方退回标准 401。
+//
+// 只在「匿名可读」的场景下才会成功 —— 私有仓库拿到的 token 仍然无权，
+// 重试依旧 401，于是返回 null，行为与改动前一致（不会把私有仓库放行）。
+// ---------------------------------------------------------------------------
+async function retryWithAnonymousToken(originalReq, challengeResp, pullScope) {
+  try {
+    const authStr = challengeResp.headers.get("WWW-Authenticate");
+    // 只处理 Bearer 挑战。Basic 挑战不碰（本代理也不转发凭据）。
+    if (!authStr || !/^bearer/i.test(authStr.trim())) return null;
+
+    const wa = parseAuthenticate(authStr);
+    const tokResp = await fetchToken(wa, pullScope, null);
+    if (!tokResp.ok) return null;
+
+    const tokJson = await tokResp.json();
+    const token = (tokJson && (tokJson.token || tokJson.access_token)) || "";
+    if (!token) return null;
+
+    const headers = new Headers(originalReq.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    const retryReq = new Request(originalReq, { headers: headers });
+    const retry = await fetch(retryReq);
+    // 重试还 401 说明该 token 无权（私有仓库）→ 交给调用方走标准 401
+    return retry.status === 401 ? null : retry;
+  } catch (e) {
+    // 换票失败绝不能把请求变成 500，退回标准 401 即可
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// [6] Registry V1 兜底：/v1/repositories/<name>/tags
+//
+// 群晖 Container Manager 在 /v2/<name>/tags/list 失败后会降级调这个已废弃的
+// V1 接口（实测日志：v2 tags/list → 1.2s 后 v1 repositories/tags）。
+// 上游 V1 已下线（registry.hub.docker.com/v1/... 返回 410 Gone），
+// 所以这里用 V2 接口自己拼一个 V1 格式的响应。
+//
+// ⚠️ 正常情况下用不到它 —— 上面的「服务端匿名换票」已经让 v2 tags/list 返回 200。
+//    留着它纯粹是最后一道保险：万一换票失败，DSM 至少还能拿到标签列表。
+//    格式是**逆向重建**的（V1 接口已死，无法对照），只保证 `name` 字段正确。
+// ---------------------------------------------------------------------------
+function registryV1TagsResponse(tags) {
+  const v1 = tags.map((t) => ({ layer: "", name: t }));
+  return new Response(JSON.stringify(v1), {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
 }
 
 function parseAuthenticate(authenticateStr) {
@@ -604,8 +756,28 @@ function responseUnauthorized(url) {
       `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
     );
   }
-  return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
-    status: 401,
-    headers: headers,
-  });
+  // 用 Registry 规范的标准错误信封，而不是自造的 {"message":"UNAUTHORIZED"}。
+  // 真实 registry-1.docker.io 的 401 长这样（2026-09-25 实测对照）：
+  //   Content-Type: application/json
+  //   docker-distribution-api-version: registry/2.0
+  //   {"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}
+  // docker CLI / Portainer 等客户端按 `errors[].code` 解析错误，格式不对会误报。
+  // （注：群晖 Container Manager 不解析 401 body，它靠的是上面的「服务端匿名换票」。）
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("docker-distribution-api-version", "registry/2.0");
+  return new Response(
+    JSON.stringify({
+      errors: [
+        {
+          code: "UNAUTHORIZED",
+          message: "authentication required",
+          detail: null,
+        },
+      ],
+    }),
+    {
+      status: 401,
+      headers: headers,
+    }
+  );
 }
