@@ -38,6 +38,10 @@ We will provide updates as soon as more information becomes available.
 
 **都不配**时回落到内置表（`*.aburling.dpdns.org` 那套），所以老部署行为不变。
 
+> ⚠️ **fork 之后第一件事：把 `wrangler.toml` 里的 `REGISTRY_ROUTES` 换成你自己的域名。**
+> 仓库里那一行是维护者自己实例的配置，不改的话你的域名只会得到 404。
+> 改文件（GitHub 网页上就能改）而不是改面板 —— 见下。
+
 例 1 —— 有自有域名，代理两个 registry：
 
 ```toml
@@ -53,6 +57,10 @@ DEFAULT_UPSTREAM = "https://registry-1.docker.io"
 ```
 
 然后在面板 **Settings → Domains & Routes → Add → Custom Domain** 里逐个绑定上面用到的主机名。
+
+> ⚠️ **`wrangler.toml` 里的值会覆盖面板值。** Git 集成每次构建都用文件里的值重新部署，
+> 所以只改面板的变量会在下次构建时被改回去。**路由配置写进文件才是持久的**；
+> 只有密码类（`AUTH_USERS`）必须走面板 Secret（仓库公开，不能进文件）。
 
 > ⚠️ `wrangler.toml` 里的 `CUSTOM_DOMAIN` 是**死变量**（代码里从没读过它），别拿它当路由配置。
 > 真正生效的只有内置表 / `REGISTRY_ROUTES` / `DEFAULT_UPSTREAM` 三者。
