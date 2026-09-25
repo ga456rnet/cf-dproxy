@@ -31,7 +31,7 @@
  */
 
 addEventListener("fetch", (event) => {
-  event.respondWith(handleRequest(event.request));
+  event.respondWith(handleRequest(event.request, event));
 });
 
 const dockerHub = "https://registry-1.docker.io";
@@ -51,6 +51,56 @@ const SEARCH_UPSTREAMS = [
   "https://hub.docker.com/v2/search/repositories/",
   "https://registry.hub.docker.com/v2/search/repositories/",
 ];
+
+// ---------------------------------------------------------------------------
+// 【临时诊断】请求记录器
+// 把最近收到的请求写进 Cloudflare 边缘缓存（caches.default），
+// 通过 GET /__reqlog 读回。用于确认"DSM 搜索到底发了什么请求"。
+// 定位完问题后把 REQLOG_ENABLED 改成 false 或整段删掉即可。
+// ---------------------------------------------------------------------------
+const REQLOG_ENABLED = true;
+const REQLOG_KEY_URL = "https://docker.aburling.dpdns.org/__reqlog";
+const REQLOG_MAX = 20;
+
+async function recordRequest(request, url) {
+  try {
+    const entry = {
+      at: new Date().toISOString(),
+      method: request.method,
+      path: url.pathname,
+      query: url.search,
+      ua: (request.headers.get("user-agent") || "").slice(0, 160),
+      accept: (request.headers.get("accept") || "").slice(0, 80),
+      hasAuth: !!request.headers.get("authorization"),
+      colo: (request.cf && request.cf.colo) || "",
+      country: (request.cf && request.cf.country) || "",
+    };
+    const key = new Request(REQLOG_KEY_URL, { method: "GET" });
+    let list = [];
+    const hit = await caches.default.match(key);
+    if (hit) {
+      try {
+        list = await hit.json();
+      } catch (e) {
+        list = [];
+      }
+      if (!Array.isArray(list)) list = [];
+    }
+    list.unshift(entry);
+    if (list.length > REQLOG_MAX) list = list.slice(0, REQLOG_MAX);
+    await caches.default.put(
+      key,
+      new Response(JSON.stringify(list), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": "max-age=600",
+        },
+      })
+    );
+  } catch (e) {
+    // 记录失败绝不能影响主流程
+  }
+}
 
 
 // ---------------------------------------------------------------------------
@@ -92,9 +142,9 @@ function routeByHosts(host) {
 // ---------------------------------------------------------------------------
 // [3] 异常兜底：把 Worker 内部错误变成可读的 500，而不是 522
 // ---------------------------------------------------------------------------
-async function handleRequest(request) {
+async function handleRequest(request, event) {
   try {
-    return await handleRequestInner(request);
+    return await handleRequestInner(request, event);
   } catch (err) {
     let host = "";
     try {
@@ -122,8 +172,35 @@ async function handleRequest(request) {
   }
 }
 
-async function handleRequestInner(request) {
+async function handleRequestInner(request, event) {
   const url = new URL(request.url);
+
+  // ---------------------------------------------------------------------------
+  // 请求记录读回接口 —— 【临时诊断用，定位完问题就删】
+  // 用途：DSM 搜索到底发了什么请求、打到哪个路径、带什么参数，只有 Worker 自己知道。
+  //      把最近 20 条请求记到边缘缓存，再用 GET /__reqlog 读回来。
+  // ---------------------------------------------------------------------------
+  if (url.pathname === "/__reqlog") {
+    const hit = await caches.default.match(
+      new Request(REQLOG_KEY_URL, { method: "GET" })
+    );
+    const body = hit ? await hit.text() : "[]";
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  }
+  // /blobs/ 是 pull 热路径，跳过记录以免拖慢镜像下载
+  if (REQLOG_ENABLED && !url.pathname.includes("/blobs/")) {
+    const p = recordRequest(request, url);
+    if (event && typeof event.waitUntil === "function") {
+      event.waitUntil(p);
+    }
+  }
+
   if (url.pathname == "/") {
     return Response.redirect(url.protocol + "//" + url.host + "/v2/", 301);
   }
@@ -177,7 +254,16 @@ async function handleRequestInner(request) {
   //   让 UI 显示"无结果"而不是报错。
   // ---------------------------------------------------------------------------
   if (url.pathname === "/v1/search" || url.pathname === "/v1/search/") {
-    const q = (url.searchParams.get("q") || "").trim();
+    // 参数名兼容：不同客户端用的名字不一样，只要有一个有值就用它。
+    // 旧版 Docker Hub 搜索 API 用 `q`，但 DSM / Portainer / 各家 CLI 未必照抄。
+    const q = (
+      url.searchParams.get("q") ||
+      url.searchParams.get("query") ||
+      url.searchParams.get("name") ||
+      url.searchParams.get("term") ||
+      url.searchParams.get("keyword") ||
+      ""
+    ).trim();
     const nRaw = parseInt(url.searchParams.get("n") || "25", 10);
     const n = Number.isFinite(nRaw) ? Math.min(Math.max(nRaw, 1), 100) : 25;
     const pageRaw = parseInt(url.searchParams.get("page") || "1", 10);
