@@ -165,10 +165,22 @@ async function handleRequestInner(request) {
     const n = Number.isFinite(nRaw) ? Math.min(Math.max(nRaw, 1), 100) : 25;
     const pageRaw = parseInt(url.searchParams.get("page") || "1", 10);
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+    // ?debug=1 —— 把上游诊断信息带进响应，便于排查"搜索返回 0 条"
+    const debug = url.searchParams.get("debug") === "1";
+    const diag = {
+      upstreamUrl: null,
+      upstreamStatus: null,
+      upstreamBody: null,
+      upstreamError: null,
+      upstreamErrorName: null,
+      rawCount: null,
+      elapsedMs: null,
+    };
 
     // 只有 Docker Hub 有公开搜索 API。其他上游（ghcr/quay/gcr/ecr...）
     // 一律返回空结果 —— 让 UI 显示"无结果"，而不是"查询注册表失败"。
     if (q && isDockerHub) {
+      const t0 = Date.now();
       try {
         const searchUrl =
           "https://hub.docker.com/v2/search/repositories/?query=" +
@@ -177,6 +189,7 @@ async function handleRequestInner(request) {
           n +
           "&page=" +
           page;
+        diag.upstreamUrl = searchUrl;
         const resp = await fetchWithTimeout(
           searchUrl,
           {
@@ -189,8 +202,11 @@ async function handleRequestInner(request) {
           },
           8000
         );
+        diag.upstreamStatus = resp.status;
         if (resp.ok) {
           const data = await resp.json();
+          diag.rawCount =
+            data && typeof data.count === "number" ? data.count : null;
           const list = Array.isArray(data && data.results) ? data.results : [];
           const results = list
             .map((it) => ({
@@ -201,30 +217,37 @@ async function handleRequestInner(request) {
               is_automated: false,
             }))
             .filter((it) => it.name !== "");
-          return new Response(
-            JSON.stringify({
-              num_results:
-                typeof data.count === "number" ? data.count : results.length,
-              query: q,
-              results: results,
-            }),
-            {
-              status: 200,
-              headers: { "content-type": "application/json; charset=utf-8" },
-            }
-          );
+          diag.elapsedMs = Date.now() - t0;
+          const body = {
+            num_results:
+              typeof data.count === "number" ? data.count : results.length,
+            query: q,
+            results: results,
+          };
+          if (debug) body.debug = diag;
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
+        }
+        // 非 2xx：把上游响应体前 300 字符留作诊断
+        try {
+          diag.upstreamBody = (await resp.text()).slice(0, 300);
+        } catch (e) {
+          /* ignore */
         }
       } catch (e) {
-        // 搜索上游失败：静默降级为空结果，不影响任何 pull 行为
+        diag.upstreamError = e && e.message ? e.message : String(e);
+        diag.upstreamErrorName = e && e.name ? e.name : null;
       }
+      diag.elapsedMs = Date.now() - t0;
     }
-    return new Response(
-      JSON.stringify({ num_results: 0, query: q, results: [] }),
-      {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      }
-    );
+    const body = { num_results: 0, query: q, results: [] };
+    if (debug) body.debug = diag;
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
   }
 
   if (url.pathname == "/v2/") {
