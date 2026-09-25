@@ -25,6 +25,20 @@
  *     UI 表现为「查询注册表失败」。详见 handleRequestInner 里的 /v1/search 分支。
  *     —— 该兼容层**只影响搜索**，任何情况下都不影响 pull。
  *
+ * [5] 服务端匿名换票 —— 修「下载时查询注册表失败」（详见 retryWithAnonymousToken）。
+ *
+ * [6] Registry V1 兜底 /v1/repositories/<name>/tags（详见 registryV1TagsResponse）。
+ *
+ * [7] 轻量鉴权 + 速率限制（可选，默认关闭）。
+ *     见下面 AUTH_* / RATE_LIMIT_* 配置块。默认 `AUTH_ENABLED=false`、
+ *     `RATE_LIMIT_ENABLED=true`（额度宽松到不可能影响正常 pull）。
+ *     关键约束：**代理自己的凭据绝不转发给上游**（见 stripUpstreamAuth）。
+ *
+ * 已移除：临时诊断用的「请求记录器」（REQLOG_* 常量 / 记录函数 / GET /__reqlog 路由）。
+ *     它的作用是抓 DSM 到底发了什么请求，故障已定位并修复，故连同接口一并删除
+ *     —— 留着一个匿名可读的请求日志接口本身就是信息泄露面。
+ *     （回归测试 [14] 会断言这三样东西都不在源码里。）
+ *
  * 兼容性：本文件仍使用 Service Worker 语法（addEventListener），
  * 与仓库现有 wrangler.toml（无 main 字段、compatibility_date = 2023-12-01）保持一致，
  * 部署命令无需改动。
@@ -53,57 +67,6 @@ const SEARCH_UPSTREAMS = [
 ];
 
 // ---------------------------------------------------------------------------
-// 【临时诊断】请求记录器
-// 把最近收到的请求写进 Cloudflare 边缘缓存（caches.default），
-// 通过 GET /__reqlog 读回。用于确认"DSM 搜索到底发了什么请求"。
-// 定位完问题后把 REQLOG_ENABLED 改成 false 或整段删掉即可。
-// ---------------------------------------------------------------------------
-const REQLOG_ENABLED = true;
-const REQLOG_KEY_URL = "https://docker.aburling.dpdns.org/__reqlog";
-const REQLOG_MAX = 20;
-
-async function recordRequest(request, url) {
-  try {
-    const entry = {
-      at: new Date().toISOString(),
-      method: request.method,
-      path: url.pathname,
-      query: url.search,
-      ua: (request.headers.get("user-agent") || "").slice(0, 160),
-      accept: (request.headers.get("accept") || "").slice(0, 80),
-      hasAuth: !!request.headers.get("authorization"),
-      colo: (request.cf && request.cf.colo) || "",
-      country: (request.cf && request.cf.country) || "",
-    };
-    const key = new Request(REQLOG_KEY_URL, { method: "GET" });
-    let list = [];
-    const hit = await caches.default.match(key);
-    if (hit) {
-      try {
-        list = await hit.json();
-      } catch (e) {
-        list = [];
-      }
-      if (!Array.isArray(list)) list = [];
-    }
-    list.unshift(entry);
-    if (list.length > REQLOG_MAX) list = list.slice(0, REQLOG_MAX);
-    await caches.default.put(
-      key,
-      new Response(JSON.stringify(list), {
-        headers: {
-          "content-type": "application/json",
-          "cache-control": "max-age=600",
-        },
-      })
-    );
-  } catch (e) {
-    // 记录失败绝不能影响主流程
-  }
-}
-
-
-// ---------------------------------------------------------------------------
 // [1] 安全读取部署变量：未注入时返回默认值，绝不抛 ReferenceError
 //     （typeof 作用于未声明的标识符是安全的，不会抛错）
 // ---------------------------------------------------------------------------
@@ -114,6 +77,229 @@ const RUNTIME_TARGET_UPSTREAM =
     ? String(TARGET_UPSTREAM)
     : "";
 
+// ---------------------------------------------------------------------------
+// [7] 轻量鉴权 + 速率限制
+//
+// 设计原则（三条，按优先级）：
+//   1) **默认不改行为**。`AUTH_ENABLED` 默认 false，不设变量就等于没这层；
+//      `RATE_LIMIT_PER_MIN` 默认额度大到正常 pull 永远碰不到。
+//   2) **绝不破坏 pull**。见下面「凭据绝不转发上游」那段注释。
+//   3) **不引入额外依赖**。全部基于 Worker 内存 + 环境变量，
+//      不需要 KV / D1 / Durable Objects（免费额度够用，也不用配存储）。
+//
+// 环境变量（在 Cloudflare 面板 Worker → Settings → Variables 里加，
+// 或写进 wrangler.toml 的 [vars]；密码类建议用 Secrets 而不是明文 var）：
+//
+//   AUTH_ENABLED       "false" | "true"          总开关，默认 false
+//   AUTH_USERS         "user1:pass1,user2:pass2" 允许的用户名/密码对（ASCII）
+//   AUTH_TOKEN         "..."                     可选的固定 Bearer 令牌；留空则自动派生
+//   RATE_LIMIT_ENABLED "true" | "false"          默认 true
+//   RATE_LIMIT_PER_MIN "600"                     每 IP 每分钟额度，默认 600
+//
+// 为什么选 HTTP Basic 作为主载体：
+//   群晖「Container Manager → 注册表」的登录表单**只有用户名 + 密码两个框**，
+//   它能表达的凭据形式只有 Basic。所以 Basic 是唯一对群晖零改造的载体。
+//   Bearer 作为**第二载体**兼容 docker CLI 的 token 流程（见 /v2/auth 分支）。
+//
+// ⚠️ 已知边界（务必知道）：
+//   a) 速率限制是**单 isolate 内存计数**，Cloudflare 会在多个 isolate / colo
+//      之间分摊请求，所以它只是「限流」，不是「硬闸」。真正的硬限流要用
+//      Cloudflare 面板的 Security → WAF → Rate limiting rules（免费版可用）。
+//   b) 启用鉴权后，客户端**自带的**上游凭据不能再透传（因为它和我们的凭据
+//      走同一个 Authorization 头，无法区分）。群晖本来就不带上游凭据，不受影响。
+//   c) Basic 的密码用 UTF-8 解码，但建议只用 ASCII —— 部分客户端按 latin1 编码。
+// ---------------------------------------------------------------------------
+// 注意命名：本文件的局部常量**不能**叫 AUTH_ENABLED / AUTH_USERS / AUTH_TOKEN /
+// RATE_LIMIT_*，否则会遮蔽同名环境变量，`typeof X` 会撞上 TDZ 直接抛
+// "Cannot access 'X' before initialization"。所以局部一律改名
+// （AUTH_ON / AUTH_TOKEN_ISSUED / RATE_LIMIT_ON ...），读全局时才用原始名。
+const AUTH_ON =
+  typeof AUTH_ENABLED !== "undefined" && String(AUTH_ENABLED).toLowerCase() === "true";
+const AUTH_USERS_RAW = typeof AUTH_USERS !== "undefined" ? String(AUTH_USERS) : "";
+const AUTH_TOKEN_RAW = typeof AUTH_TOKEN !== "undefined" ? String(AUTH_TOKEN) : "";
+
+// 速率限制默认**开**（额度宽松到正常 pull 碰不到），只有显式写 false 才关。
+const RATE_LIMIT_ON =
+  typeof RATE_LIMIT_ENABLED === "undefined" ||
+  String(RATE_LIMIT_ENABLED).toLowerCase() !== "false";
+const RATE_LIMIT_BUDGET = (() => {
+  const v = typeof RATE_LIMIT_PER_MIN !== "undefined" ? parseInt(String(RATE_LIMIT_PER_MIN), 10) : NaN;
+  return Number.isFinite(v) && v > 0 ? v : 600;
+})();
+
+// "user1:pass1,user2:pass2" -> Map{user1 => pass1, ...}
+// 密码里可以带冒号（只按**第一个**冒号切分），用户名里不行。
+function parseAuthUsers(raw) {
+  const map = new Map();
+  if (!raw) return map;
+  for (const pair of String(raw).split(",")) {
+    const s = pair.trim();
+    if (!s) continue;
+    const i = s.indexOf(":");
+    if (i <= 0) continue;
+    const user = s.slice(0, i).trim();
+    const pass = s.slice(i + 1);
+    if (user) map.set(user, pass);
+  }
+  return map;
+}
+const AUTH_USERS_MAP = parseAuthUsers(AUTH_USERS_RAW);
+
+// 恒定时间比较 —— 避免用 `===` 逐字符短路比较泄露长度/前缀信息。
+function safeEqual(a, b) {
+  const sa = String(a);
+  const sb = String(b);
+  if (sa.length !== sb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < sa.length; i++) diff |= sa.charCodeAt(i) ^ sb.charCodeAt(i);
+  return diff === 0;
+}
+
+// FNV-1a：只用来把 AUTH_USERS 派生成一个**客户端猜不出**的令牌。
+// 安全性来自"AUTH_USERS 是秘密"，不是来自这个哈希 —— 所以它只当第二载体用，
+// 主载体始终是 Basic。未配置 AUTH_TOKEN 时自动派生，省得用户多配一个变量。
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+const AUTH_TOKEN_ISSUED =
+  AUTH_TOKEN_RAW ||
+  (AUTH_USERS_RAW
+    ? "dpx" +
+      fnv1a(AUTH_USERS_RAW + "|cf-dproxy").toString(36) +
+      fnv1a("cf-dproxy|" + AUTH_USERS_RAW).toString(36)
+    : "");
+
+// 解出 Basic 凭据。用 TextDecoder 解 UTF-8（atob 只给 latin1）。
+function decodeBasic(headerValue) {
+  const m = /^basic\s+([A-Za-z0-9+/=]+)$/i.exec(String(headerValue || "").trim());
+  if (!m) return null;
+  try {
+    const bin = atob(m[1]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const text = new TextDecoder("utf-8").decode(bytes);
+    const i = text.indexOf(":");
+    if (i < 0) return null;
+    return { user: text.slice(0, i), pass: text.slice(i + 1) };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 返回 { ok, ours, via }
+//   ok   —— 是否放行
+//   ours —— 这个 Authorization 头是"代理自己的凭据"（= 转发上游前必须删掉）
+// 鉴权关闭时一律放行，且 ours=false（保持原样透传，行为与改动前完全一致）。
+function checkAuth(request) {
+  if (!AUTH_ON) return { ok: true, ours: false, via: "off" };
+
+  const h = request.headers.get("Authorization");
+  if (!h) return { ok: false, ours: false, via: null };
+
+  const basic = decodeBasic(h);
+  if (basic) {
+    if (AUTH_USERS_MAP.has(basic.user) && safeEqual(AUTH_USERS_MAP.get(basic.user), basic.pass)) {
+      return { ok: true, ours: true, via: "basic", user: basic.user };
+    }
+    return { ok: false, ours: false, via: null };
+  }
+
+  const bm = /^bearer\s+(.+)$/i.exec(String(h).trim());
+  if (bm) {
+    const tok = bm[1].trim();
+    if (AUTH_TOKEN_ISSUED && safeEqual(AUTH_TOKEN_ISSUED, tok)) return { ok: true, ours: true, via: "bearer" };
+    // 也接受"密码直接当令牌"——某些客户端只会填一个 token 框
+    for (const pass of AUTH_USERS_MAP.values()) {
+      if (pass && safeEqual(pass, tok)) return { ok: true, ours: true, via: "bearer" };
+    }
+  }
+  return { ok: false, ours: false, via: null };
+}
+
+// ---------------------------------------------------------------------------
+// [7] 速率限制 —— 固定窗口（每分钟一个桶），按 CF-Connecting-IP 计数
+//
+// CF-Connecting-IP 由 Cloudflare 边缘写入且会覆盖客户端伪造值，可作可信来源。
+// 拿不到时退回 UA 哈希，避免把所有匿名请求挤进同一个桶。
+//
+// 分两档额度：/blobs/ 是 pull 热路径（一个多层镜像可能几十个 blob），
+// 给 4 倍额度；其余路径（搜索 / tags/list / manifests）是刷接口的主要入口，
+// 用基准额度。这样"正常拉一个镜像"永远撞不到限流。
+// ---------------------------------------------------------------------------
+const RATE_STATE = new Map();
+const RATE_WINDOW_MS = 60000;
+let RATE_LAST_SWEEP = 0;
+
+function rateKeyOf(request) {
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip) return "ip:" + ip;
+  const ua = request.headers.get("user-agent") || "";
+  return "ua:" + fnv1a(ua).toString(36);
+}
+
+function rateLimitHit(key, budget) {
+  const now = Date.now();
+  const bucket = Math.floor(now / RATE_WINDOW_MS);
+  let rec = RATE_STATE.get(key);
+  if (!rec || rec.bucket !== bucket) {
+    rec = { bucket: bucket, count: 0 };
+    RATE_STATE.set(key, rec);
+  }
+  rec.count++;
+  // 偶发清理过期桶，防止 isolate 长驻时 Map 无限增长
+  if (RATE_STATE.size > 5000 && now - RATE_LAST_SWEEP > RATE_WINDOW_MS) {
+    RATE_LAST_SWEEP = now;
+    for (const [k, v] of RATE_STATE) {
+      if (v.bucket !== bucket) RATE_STATE.delete(k);
+    }
+  }
+  return { count: rec.count, over: rec.count > budget };
+}
+
+function responseTooManyRequests(retryAfterSec) {
+  const headers = new Headers();
+  headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("retry-after", String(retryAfterSec));
+  headers.set("docker-distribution-api-version", "registry/2.0");
+  return new Response(
+    JSON.stringify({
+      errors: [
+        {
+          code: "TOOMANYREQUESTS",
+          message: "too many requests, slow down",
+          detail: null,
+        },
+      ],
+    }),
+    { status: 429, headers: headers }
+  );
+}
+
+// 鉴权未通过时的 401 —— 用 **Basic** 挑战（群晖的登录框就是用户名+密码）。
+function responseAuthRequired() {
+  const headers = new Headers();
+  headers.set("WWW-Authenticate", 'Basic realm="cf-dproxy", charset="UTF-8"');
+  headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("docker-distribution-api-version", "registry/2.0");
+  return new Response(
+    JSON.stringify({
+      errors: [
+        {
+          code: "UNAUTHORIZED",
+          message: "authentication required",
+          detail: "此代理已启用访问控制，请在注册表登录处填写用户名与密码。",
+        },
+      ],
+    }),
+    { status: 401, headers: headers }
+  );
+}
+
 const routes = {
   // production
   ["docker.aburling.dpdns.org"]: dockerHub,
@@ -122,8 +308,11 @@ const routes = {
   ["k8s-gcr.aburling.dpdns.org"]: "https://k8s.gcr.io",
   ["k8s.aburling.dpdns.org"]: "https://registry.k8s.io",
   ["ghcr.aburling.dpdns.org"]: "https://ghcr.io",
-  ["cloudsmith.aburling.dpdns.org"]: "https://docker.cloudsmith.io",
   ["ecr.aburling.dpdns.org"]: "https://public.ecr.aws",
+  // 注：原表里的 cloudsmith.aburling.dpdns.org 已删除 ——
+  //     该主机名在 DNS 里根本不存在（Cloudflare 面板没建 Custom Domain），
+  //     留着只会让人以为"能用"。要恢复：先在面板建 Custom Domain，
+  //     再把 ["cloudsmith.aburling.dpdns.org"]: "https://docker.cloudsmith.io" 加回来。
 
   // staging
   ["docker-staging.aburling.dpdns.org"]: dockerHub,
@@ -175,32 +364,6 @@ async function handleRequest(request, event) {
 async function handleRequestInner(request, event) {
   const url = new URL(request.url);
 
-  // ---------------------------------------------------------------------------
-  // 请求记录读回接口 —— 【临时诊断用，定位完问题就删】
-  // 用途：DSM 搜索到底发了什么请求、打到哪个路径、带什么参数，只有 Worker 自己知道。
-  //      把最近 20 条请求记到边缘缓存，再用 GET /__reqlog 读回来。
-  // ---------------------------------------------------------------------------
-  if (url.pathname === "/__reqlog") {
-    const hit = await caches.default.match(
-      new Request(REQLOG_KEY_URL, { method: "GET" })
-    );
-    const body = hit ? await hit.text() : "[]";
-    return new Response(body, {
-      status: 200,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
-      },
-    });
-  }
-  // /blobs/ 是 pull 热路径，跳过记录以免拖慢镜像下载
-  if (REQLOG_ENABLED && !url.pathname.includes("/blobs/")) {
-    const p = recordRequest(request, url);
-    if (event && typeof event.waitUntil === "function") {
-      event.waitUntil(p);
-    }
-  }
-
   if (url.pathname == "/") {
     return Response.redirect(url.protocol + "//" + url.host + "/v2/", 301);
   }
@@ -227,7 +390,34 @@ async function handleRequestInner(request, event) {
     );
   }
   const isDockerHub = upstream == dockerHub;
-  const authorization = request.headers.get("Authorization");
+
+  // ---------------------------------------------------------------------------
+  // [7] 访问控制闸门（鉴权 + 速率限制）
+  //
+  // 位置讲究：放在 routes 解析**之后**，这样"主机名没配"仍然返回带 routes 表的
+  // 404（这是排障时最有用的一条信息），不会被 401 盖掉。
+  //
+  // 两条独立的闸门，互不耦合：
+  //   1) 鉴权（默认关）：不通过 -> 401 + Basic 挑战。
+  //   2) 速率限制（默认开）：超额度 -> 429 + Retry-After。
+  // ---------------------------------------------------------------------------
+  const authResult = checkAuth(request);
+  if (!authResult.ok) {
+    return responseAuthRequired();
+  }
+  // 客户端带的是"我们自己的凭据" -> 转发上游前必须删掉它。
+  // 这是本层最关键的一条约束：代理的用户名密码绝不能流到 registry-1.docker.io。
+  const stripUpstreamAuth = authResult.ours;
+  let authorization = stripUpstreamAuth ? null : request.headers.get("Authorization");
+
+  if (RATE_LIMIT_ON) {
+    const isBlob = url.pathname.includes("/blobs/");
+    const budget = isBlob ? RATE_LIMIT_BUDGET * 4 : RATE_LIMIT_BUDGET;
+    const rl = rateLimitHit(rateKeyOf(request), budget);
+    if (rl.over) {
+      return responseTooManyRequests(Math.ceil(RATE_WINDOW_MS / 1000));
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // [4] DSM / Portainer 等 UI 的「搜索注册表」兼容层
@@ -476,6 +666,30 @@ async function handleRequestInner(request, event) {
   }
   // get token
   if (url.pathname == "/v2/auth") {
+    // -------------------------------------------------------------------------
+    // [7] 启用鉴权时，令牌由**我们自己**签发，不去问上游。
+    //
+    // 为什么必须短路：这个端点原本是"转发上游 /v2/ 拿挑战 → 换匿名 token"。
+    // 若鉴权开着还照原样转发，任何人只要匿名请求 /v2/auth 就能拿到一个可用的
+    // 匿名 token —— 鉴权形同虚设。
+    //
+    // 走到这里说明客户端**已经**通过了 checkAuth（否则上面就 401 了），
+    // 所以直接回我们自己的令牌。令牌 = AUTH_TOKEN（未配置时由 AUTH_USERS 派生）。
+    // -------------------------------------------------------------------------
+    if (AUTH_ON) {
+      return new Response(
+        JSON.stringify({
+          token: AUTH_TOKEN_ISSUED,
+          access_token: AUTH_TOKEN_ISSUED,
+          expires_in: 3600,
+          issued_at: new Date().toISOString(),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        }
+      );
+    }
     const newUrl = new URL(upstream + "/v2/");
     const resp = await fetch(newUrl.toString(), {
       method: "GET",
@@ -514,9 +728,16 @@ async function handleRequestInner(request, event) {
   }
   // foward requests
   const newUrl = new URL(upstream + url.pathname);
+  // [7] 转发前把"代理自己的凭据"摘掉 —— 用户名密码绝不能流到上游 registry。
+  //     鉴权关闭时 stripUpstreamAuth 恒为 false，headers 原样透传（行为不变）。
+  let forwardHeaders = request.headers;
+  if (stripUpstreamAuth) {
+    forwardHeaders = new Headers(request.headers);
+    forwardHeaders.delete("Authorization");
+  }
   const newReq = new Request(newUrl, {
     method: request.method,
-    headers: request.headers,
+    headers: forwardHeaders,
     // don't follow redirect to dockerhub blob upstream
     redirect: isDockerHub ? "manual" : "follow",
   });

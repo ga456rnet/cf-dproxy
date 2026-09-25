@@ -34,10 +34,30 @@ MODE = "production"
 TARGET_UPSTREAM = ""
 CUSTOM_DOMAIN = "aburling.dpdns.org"
 
+# --- 访问控制（[7] 轻量鉴权 + 速率限制）---
+#
+# ⚠️ 这里只放**开关和额度**，不放密码。
+#    原因：本仓库是 **public**，写在这里等于把密码公开到 GitHub。
+#    用户名/密码请用下面两种方式之一配置：
+#      A) 面板：Worker → Settings → Variables and Secrets → 添加 **Secret** 类型
+#               AUTH_USERS = "user1:pass1,user2:pass2"
+#      B) CLI ：npx wrangler secret put AUTH_USERS --env production
+#    改完 Secret 后需重新部署（或在面板里保存）才会生效。
+#
+# 另：仓库 public 意味着"藏地址"这条路本来就走不通，
+#    所以鉴权是**唯一**能防白嫖的手段 —— 一旦决定不公开给别人用，就把
+#    AUTH_ENABLED 设成 "true" 并配上 AUTH_USERS。
+AUTH_ENABLED = "false"   # 总开关；默认关 = 部署后行为与改动前完全一致
+# AUTH_TOKEN = ""        # 可选：固定 Bearer 令牌。留空则由 AUTH_USERS 自动派生
+RATE_LIMIT_ENABLED = "true"
+RATE_LIMIT_PER_MIN = "600"  # 每 IP 每分钟；/blobs/ 自动 ×4（正常 pull 撞不到）
+
 [env.dev.vars]
 MODE = "debug"
 TARGET_UPSTREAM = "https://registry-1.docker.io"
 CUSTOM_DOMAIN = "exmaple.com"
+AUTH_ENABLED = "false"
+RATE_LIMIT_ENABLED = "false"   # 本地调试不限流
 
 [env.production]
 name = "cloudflare-docker-proxy"
@@ -55,14 +75,20 @@ name = "cloudflare-docker-proxy"
 #   { pattern = "k8s-gcr.aburling.dpdns.org",    custom_domain = true },
 #   { pattern = "k8s.aburling.dpdns.org",        custom_domain = true },
 #   { pattern = "ghcr.aburling.dpdns.org",       custom_domain = true },
-#   { pattern = "cloudsmith.aburling.dpdns.org", custom_domain = true },
 #   { pattern = "ecr.aburling.dpdns.org",        custom_domain = true },
 # ]
+# 注：cloudsmith.aburling.dpdns.org 已从 src/index.js 的 routes 表删除 ——
+#     它的 DNS 根本不存在（面板没建 Custom Domain），留着只会误导。
+#     要恢复：先在面板建 Custom Domain，再把 routes 表那一行加回来。
 
 [env.production.vars]
 MODE = "production"
 TARGET_UPSTREAM = ""
 CUSTOM_DOMAIN = "aburling.dpdns.org"
+# ⚠️ wrangler 的 env.vars **不继承**顶层 [vars]，所以这里必须重复一遍。
+AUTH_ENABLED = "false"
+RATE_LIMIT_ENABLED = "true"
+RATE_LIMIT_PER_MIN = "600"
 
 [env.staging]
 name = "cloudflare-docker-proxy-staging"
