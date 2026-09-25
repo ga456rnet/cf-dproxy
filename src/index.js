@@ -264,22 +264,58 @@ async function handleRequestInner(request, event) {
       url.searchParams.get("keyword") ||
       ""
     ).trim();
+
+    // -------------------------------------------------------------------------
+    // 【关键修复】剥掉 DSM 硬加的 `library/` 前缀
+    //
+    // 实测（2026-09-25，抓 DSM 真实请求 + 上游对照）：
+    //   DSM 搜索时发的 query 是 `library/<用户输入>`，空搜索时是 `library/`：
+    //     GET /v1/search?q=library/vaultwarden&n=50&page=1
+    //     GET /v1/search?q=library/memos&n=50&page=1
+    //     GET /v1/search?q=library/&n=50&page=1
+    //
+    //   而 Docker Hub 上 `library/vaultwarden` **匹配不到任何东西**，
+    //   于是它退化成一堆无关的流行镜像：
+    //     q=library/vaultwarden -> count=8952   nginx / busybox / postgres / ubuntu
+    //     q=library/memos       -> count=8935   nginx / busybox / postgres / ubuntu
+    //   剥掉前缀后：
+    //     q=vaultwarden         -> count=354    vaultwarden/server ✅
+    //     q=memos               -> count=332    neosmemo/memos ✅
+    //
+    //   所以：带前缀就剥掉再查；剥完为空（=空搜索）就用 `library` 查，
+    //   这样能列出官方镜像，正好符合 DSM「空搜索浏览」的预期。
+    // -------------------------------------------------------------------------
+    const LIBRARY_PREFIX = "library/";
+    let qForSearch = q;
+    let strippedPrefix = false;
+    if (q.toLowerCase().startsWith(LIBRARY_PREFIX)) {
+      const rest = q.slice(LIBRARY_PREFIX.length).trim();
+      qForSearch = rest === "" ? "library" : rest;
+      strippedPrefix = true;
+    }
+
     const nRaw = parseInt(url.searchParams.get("n") || "25", 10);
     const n = Number.isFinite(nRaw) ? Math.min(Math.max(nRaw, 1), 100) : 25;
     const pageRaw = parseInt(url.searchParams.get("page") || "1", 10);
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
     // ?debug=1 —— 把上游诊断信息带进响应，便于排查"搜索返回 0 条"
     const debug = url.searchParams.get("debug") === "1";
-    const diag = { attempts: [], resolvedBy: null };
+    const diag = {
+      receivedQuery: q,
+      effectiveQuery: qForSearch,
+      strippedLibraryPrefix: strippedPrefix,
+      attempts: [],
+      resolvedBy: null,
+    };
 
     let results = null;
     let total = 0;
 
     // 只有 Docker Hub 有公开搜索 API。其他上游（ghcr/quay/gcr/ecr...）
     // 一律返回空结果 —— 让 UI 显示"无结果"，而不是"查询注册表失败"。
-    if (q && isDockerHub) {
+    if (qForSearch && isDockerHub) {
       // ---- 1) 依次尝试各搜索上游 ----
-      const qs = `?query=${encodeURIComponent(q)}&page_size=${n}&page=${page}`;
+      const qs = `?query=${encodeURIComponent(qForSearch)}&page_size=${n}&page=${page}`;
       for (const base of SEARCH_UPSTREAMS) {
         const target = base + qs;
         const rec = { url: target, status: null, body: null, error: null };
@@ -328,7 +364,10 @@ async function handleRequestInner(request, event) {
       //   能覆盖"用户已经知道镜像名，只想在 UI 里把它拉下来"这个真实场景。
       //   例：输入 `vaultwarden/server` → 命中；输入 `redis` → 命中 library/redis。
       if (results === null) {
-        const candidates = q.includes("/") ? [q] : ["library/" + q, q];
+        // 用剥过前缀的 qForSearch，避免拿 DSM 的 `library/vaultwarden` 去校验
+        const candidates = qForSearch.includes("/")
+          ? [qForSearch]
+          : ["library/" + qForSearch, qForSearch];
         const found = [];
         for (const name of candidates) {
           const rec = { probe: name, exists: false, tagCount: null, error: null };
@@ -366,6 +405,53 @@ async function handleRequestInner(request, event) {
       status: 200,
       headers: { "content-type": "application/json; charset=utf-8" },
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // DSM 每次搜索前都会先 GET /v2/_catalog（实测请求记录证实）。
+  // 原来这条会透传给 registry-1.docker.io，而 Docker Hub 不对匿名开放目录，
+  // 于是返回 401 —— 让 DSM 的浏览视图报错。
+  // 这里给 Docker Hub 返回一份「官方镜像清单」当目录；任何失败都降级为
+  // 空目录 + 200。**永远不再返回 401。**
+  // 只对 Docker Hub 生效，其他上游保持原样透传（最小改动面）。
+  // ---------------------------------------------------------------------------
+  if (url.pathname === "/v2/_catalog" && isDockerHub) {
+    const emptyCatalog = () =>
+      new Response(JSON.stringify({ repositories: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    try {
+      const resp = await fetchWithTimeout(
+        "https://registry.hub.docker.com/v2/repositories/library/?page_size=100",
+        {
+          method: "GET",
+          headers: {
+            accept: "application/json",
+            "user-agent": "cf-docker-proxy-search/1.0",
+          },
+          redirect: "follow",
+        },
+        8000
+      );
+      if (!resp.ok) return emptyCatalog();
+      const data = await resp.json();
+      const list = Array.isArray(data && data.results) ? data.results : [];
+      const repositories = list
+        .map((it) => {
+          const ns = it.namespace || "library";
+          const nm = it.name || "";
+          if (!nm) return "";
+          return nm.includes("/") ? nm : ns + "/" + nm;
+        })
+        .filter((s) => s !== "");
+      return new Response(JSON.stringify({ repositories: repositories }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    } catch (e) {
+      return emptyCatalog();
+    }
   }
 
   if (url.pathname == "/v2/") {
