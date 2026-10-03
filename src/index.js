@@ -34,6 +34,15 @@
  *     `RATE_LIMIT_ENABLED=true`（额度宽松到不可能影响正常 pull）。
  *     关键约束：**代理自己的凭据绝不转发给上游**（见 stripUpstreamAuth）。
  *
+ * [8] 路由表可配置化 / [9] 已过门禁的 `GET /v2/` 返回 200。
+ *
+ * [9] 修「docker login 恒报 failed with status: 401」—— **这不是凭据问题**。
+ *     根因：docker 的 `loginV2()` 硬要求 /v2/ ping 返回 200，而本代理原先恒返 401
+ *     （`pullScopeFromPath("/v2/")` 为 null + 换票闸门是 `!authorization`）。
+ *     现在：凭据通过门禁（`stripUpstreamAuth`）时直接回 200 + `{}`。
+ *     ⚠️ 只精确匹配 `/v2/`，**绝不能让 `/v2/_catalog` 也 200**（DSM 会切目录模式、
+ *        搜索框失效，见 handleRequestInner 里 _catalog 那段）。详见该分支注释。
+ *
  * 已移除：临时诊断用的「请求记录器」（REQLOG_* 常量 / 记录函数 / GET /__reqlog 路由）。
  *     它的作用是抓 DSM 到底发了什么请求，故障已定位并修复，故连同接口一并删除
  *     —— 留着一个匿名可读的请求日志接口本身就是信息泄露面。
@@ -307,6 +316,25 @@ function responseTooManyRequests(retryAfterSec) {
     }),
     { status: 429, headers: headers }
   );
+}
+
+// [9] 版本探测端点 `GET /v2/` 的「200 OK」响应。
+//
+// 为什么需要一个专门的函数（而不是内联一段 new Response）：
+//   这个响应有**三个客户端各自认不同字段**，少一个就有人登不进来：
+//     - docker CLI (`loginV2`)  只认状态码 200，但会检查 Content-Type 是 JSON；
+//       空 body 会让它把 ping 判为"不可用"，所以必须回一个合法 JSON 对象。
+//     - 部分客户端认 `Docker-Distribution-Api-Version` 响应头
+//       （Registry 规范里这个头是**响应头**，不是请求头）。
+//     - `{}` 是最小合法 JSON，不泄露任何仓库/镜像/账号信息。
+//
+// 安全性：本函数只在 `stripUpstreamAuth === true`（凭据已过门禁）时被调用，
+//   匿名请求永远拿不到它。所以它**不是**一个匿名可访问的接口。
+function responseVersionProbeOk() {
+  const headers = new Headers();
+  headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("docker-distribution-api-version", "registry/2.0");
+  return new Response("{}", { status: 200, headers: headers });
 }
 
 // 鉴权未通过时的 401 —— 用 **Basic** 挑战（群晖的登录框就是用户名+密码）。
@@ -836,6 +864,46 @@ async function handleRequestInner(request, event) {
   // ---------------------------------------------------------------------------
 
   if (url.pathname == "/v2/") {
+    // -------------------------------------------------------------------------
+    // [9] 已通过门禁的 /v2/ 直接返回 200 —— 修「docker login 必然失败」
+    //
+    // 症状：`docker login <任意已配置域名>` 恒报
+    //   Error response from daemon: login attempt to https://<域>/v2/ failed
+    //   with status: 401 Unauthorized
+    // 即使用户名密码完全正确（群晖 DSM 用同一组凭据能正常搜索/下载）。
+    //
+    // 根因（2026-10-03 读 docker CLI 源码 + 线上 4 步探针坐实）：
+    //   docker 的 `loginV2()` 在 ping `GET /v2/` 之后**硬要求状态码是 200**，
+    //   遇到 401 不解析挑战、不换票，直接判定「登录失败」。
+    //   而本代理的 /v2/ 之前**永远**返回 401，原因有两条叠加：
+    //     a) `pullScopeFromPath("/v2/")` 返回 null → 走到不了「服务端匿名换票」；
+    //     b) 换票闸门是 `!authorization`，客户端带了 Basic 反而更不会换票。
+    //   所以带凭据打 /v2/ 拿到的 401，其实是**上游 registry 按协议该给的那个
+    //   401**（body 里 `detail:null`，不是被本代理门禁拦的那个）——
+    //   密码是对的，却被 docker 当成登录失败。
+    //
+    // 修法：走完 checkAuth 说明凭据已被本代理接受，此时直接回 200 空 JSON，
+    //   不再向上游转发。这是 docker 唯一能接受的「登录成功」信号。
+    //   /v2/ 本身只是个**版本探测端点**，语义上不承诺任何内容，
+    //   回 200 不泄露任何仓库/镜像信息（真正的数据都在 manifests/blobs/tags 上，
+    //   那些路径依旧走「匿名换票」或上游鉴权，该 401 还是 401）。
+    //
+    // ⚠️ 三条边界，缺一不可：
+    //   1) 判据用 `stripUpstreamAuth`（= authResult.ours，代表「凭据是本代理的」）。
+    //      **不能**用 AUTH_GATE_ACTIVE —— 鉴权关闭时它恒为 false，
+    //      行为必须与改动前完全一致（继续向上游转发、该 401 就 401）。
+    //   2) 只在 `/v2/` 精确路径生效。
+    //      **绝不能**顺手让 `/v2/_catalog` 也 200 —— DSM 一旦看到 catalog 是 200，
+    //      就会切到「目录浏览」模式、搜索框失效（这个坑见上面 [6] 那大段注释）。
+    //   3) 不碰「未过门禁」的情况：匿名仍然是 401 + Basic 挑战（见 checkAuth 分支），
+    //      所以门禁强度没有任何下降 —— 未登录的 docker 依旧登不进来。
+    //
+    // 影响面：本改动**只让"凭据正确的客户端"少走一次弯路**，不放行任何匿名请求。
+    //   群晖 DSM 不依赖 /v2/ 得 200（它全程走 Basic，已实测），故对它无副作用。
+    // -------------------------------------------------------------------------
+    if (stripUpstreamAuth) {
+      return responseVersionProbeOk();
+    }
     const newUrl = new URL(upstream + "/v2/");
     const headers = new Headers();
     if (authorization) {
@@ -853,6 +921,12 @@ async function handleRequestInner(request, event) {
     return resp;
   }
   // get token
+  // ---------------------------------------------------------------------------
+  // docker CLI 会在换票请求里带一个 `?account=<用户名>` 参数。
+  // 本代理的令牌是全局的、不区分账号，忽略它即可 —— 这里显式记录一下，
+  // 免得后来者看到 query 里多出个参数以为是 bug。
+  // （注意：**不要**把它透传给上游 auth 服务，Docker Hub 的令牌与账号无关。）
+  // ---------------------------------------------------------------------------
   if (url.pathname == "/v2/auth") {
     // -------------------------------------------------------------------------
     // [7] 启用鉴权时，令牌由**我们自己**签发，不去问上游。
@@ -1070,8 +1144,13 @@ async function probeRepoName(name, limit) {
 //   /v2/<name...>/manifests/<ref>   -> repository:<name>:pull
 //   /v2/<name...>/blobs/<digest>    -> repository:<name>:pull
 //   /v2/<name...>/tags/list         -> repository:<name>:pull
-//   /v2/                            -> null   （无 scope，故意不注入）
+//   /v2/                            -> null   （故意不注入；已在上面被 [9] 短路成 200）
 //   /v2/_catalog                    -> null   （故意不注入，见上面 _catalog 那段注释）
+//
+// ⚠️ 关于 `/v2/`：这里返回 null 是**有意保留**的。
+//   [9] 让"已过门禁"的 /v2/ 直接回 200，但"未过门禁"的 /v2/ 仍然要落到
+//   标准 401 挑战上（客户端据此去调 /v2/auth）。若在这里给 /v2/ 造一个 scope，
+//   匿名请求就会被自动换票放行 → 等于给未登录客户端开后门。
 //
 // 注意：官方镜像的 `library/` 前缀由上面已有的 301 补全重定向处理
 // （`/v2/busybox/tags/list` 5 段 → `/v2/library/busybox/tags/list`），
